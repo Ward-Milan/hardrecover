@@ -45,7 +45,11 @@ Le package d'installation autonome macOS (Apple Silicon) est prêt à l'emploi :
 ### Installation sur macOS
 1. Téléchargez et ouvrez **[`HardRecover_1.0.0_macOS.dmg`](https://github.com/Ward-Milan/hardrecover/releases/latest/download/HardRecover_1.0.0_macOS.dmg)** (ou directement depuis le dépôt : [HardRecover_1.0.0_macOS.dmg](HardRecover_1.0.0_macOS.dmg)).
 2. Glissez-déposez **HardRecover.app** dans votre dossier **/Applications**.
-3. *Note de sécurité macOS* : S'agissant d'un binaire open-source distribué sans signature payante Apple Developer, faites **Clic droit > Ouvrir** au premier lancement (ou autorisez l'application dans *Réglages Système > Confidentialité et sécurité > Ouvrir quand même*).
+3. *Note Gatekeeper (macOS Sequoia / Tahoe)* : L'application étant open-source (signée ad-hoc sans certificat Apple Developer payant), si macOS bloque l'ouverture après téléchargement via navigateur, exécutez dans le Terminal :
+   ```bash
+   xattr -cr /Applications/HardRecover.app
+   ```
+   (ou autorisez l'application dans *Réglages Système > Confidentialité et sécurité > Ouvrir quand même*).
 
 ---
 
@@ -142,7 +146,7 @@ npm run tauri dev
 
 ### Générer le package d'installation (.dmg)
 ```bash
-npm run tauri build -- --bundles dmg --no-sign
+npm run tauri build -- --bundles dmg
 ```
 
 ---
