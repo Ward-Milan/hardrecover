@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+dist-ssr/
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/WixTools/
+
+# macOS / OS files
+.DS_Store
+Thumbs.db
+*.swp
+
+# Logs & local env
+logs
+*.log
+npm-debug.log*
+*.local
+.env
+.env.*
+
+# Internal working specs
+CAHIER_DES_CHARGES*.md
