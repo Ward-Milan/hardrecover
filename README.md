@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Récupération deSupports Physiques, File Carving ExFAT & Reconstruction Chirurgicale de Médias</strong>
+  <strong>Récupération de Supports Physiques, File Carving ExFAT & Reconstruction Chirurgicale de Médias</strong>
   <br />
   <em>Conçu pour les DITs, chefs opérateurs, monteurs et studios de post-production sur macOS.</em>
 </p>
@@ -15,6 +15,7 @@
   <img src="https://img.shields.io/badge/Platform-macOS%20(Apple%20Silicon)-3B82F6.svg?style=flat-square" alt="macOS" />
   <img src="https://img.shields.io/badge/Engine-Rust%20%2B%20Tauri%20v2-F59E0B.svg?style=flat-square" alt="Rust Tauri" />
   <img src="https://img.shields.io/badge/UI-React%2018%20%7C%20Tailwind%20CSS-191919.svg?style=flat-square" alt="React Tailwind" />
+  <img src="https://img.shields.io/badge/Built%20With-Vibe%20Coding-8B5CF6.svg?style=flat-square" alt="Vibe Coding" />
   <img src="https://img.shields.io/badge/License-MIT-emerald.svg?style=flat-square" alt="MIT License" />
 </p>
 
@@ -33,7 +34,7 @@
 
 ## Téléchargement Direct (DMG)
 
-Le package d'installation autonome macOS (Apple Silicon) est disponible :
+Le package d'installation autonome macOS (Apple Silicon) est prêt à l'emploi :
 
 <p align="center">
   <a href="https://github.com/Ward-Milan/hardrecover/releases/latest/download/HardRecover_1.0.0_macOS.dmg">
@@ -48,10 +49,18 @@ Le package d'installation autonome macOS (Apple Silicon) est disponible :
 
 ---
 
+## Conçu en Vibe Coding
+
+HardRecover est développé en **Vibe Coding** avec **Google Antigravity** en pair-programming assisté par IA.
+
+Du parseur binaire d'entrées de répertoires ExFAT en Rust, à la synthèse d'atomes ISO-BMFF (`moov` / `stbl`) avec synchronisation audio LPCM (`twos`/`sowt`) et purge de secteurs corrompus sur flux H.264/HEVC, jusqu'au cloneur résilient 5 passes en lecture seule (`O_RDONLY` / `F_NOCACHE`), l'architecture a été conçue et validée sur de véritables rushs caméras endommagés.
+
+---
+
 ## Aperçu de l'Interface
 
 ### 1. Atelier Récupération — Exploration ExFAT & File Carving
-Identification des fichiers supprimés avec restitution des noms d'origine ExFAT, filtrage automatique des fichiers proxys caméra (`.LRF`, `.THM`), badges d'intégrité et inspecteur hexadécimal.
+Identification des fichiers supprimés avec restitution des noms d'origine ExFAT, filtrage automatique des fichiers proxys caméra (`.LRF`, `.THM`), indicateurs d'intégrité et inspecteur hexadécimal.
 
 ![HardRecover Recovery Explorer](assets/screenshots/hardrecover-recovery.png)
 
