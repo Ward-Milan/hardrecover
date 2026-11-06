@@ -280,3 +280,4 @@ rm -f "$0"
     .await
     .map_err(|e| e.to_string())?
 }
+
