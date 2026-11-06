@@ -37,7 +37,7 @@ pub struct RecoverableFileItem {
     pub header_hex_preview: String,
     pub needs_surgical_repair: bool,
     #[serde(default = "default_health_badge")]
-    pub health_badge: String, // "intact" (🟢) | "needs_repair" (🟡) | "corrupted" (🔴)
+    pub health_badge: String, // "intact" | "needs_repair" | "corrupted"
     #[serde(default)]
     pub is_proxy_or_thumb: bool,
 }

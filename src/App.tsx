@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   FolderOpen,
@@ -28,6 +29,8 @@ import {
   CheckSquare,
   Square,
   ArrowLeft,
+  ArrowRight,
+  ArrowDownToLine,
   Eye,
   FileCode,
   Disc,
@@ -61,6 +64,7 @@ import {
   ScanMode,
   MountedImageInfo,
   ForensicCertificateRequest,
+  UpdateCheckInfo,
 } from "./types";
 import { HardRecoverLogo } from "./Logo";
 import { ToolInfoModal } from "./ToolInfoModal";
@@ -251,6 +255,70 @@ export default function App() {
   const [quarantineResult, setQuarantineResult] = useState<QuarantineResult | null>(null);
   const [isRegeneratingNand, setIsRegeneratingNand] = useState<boolean>(false);
   const [regenerationResult, setRegenerationResult] = useState<NandRegenerationResult | null>(null);
+
+  /* ================= IN-APP AUTO-UPDATER STATE ================= */
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckInfo | null>(null);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState<boolean>(false);
+  const [isUpdateModalOpen, setIsUpdateModalOpen] = useState<boolean>(false);
+  const [isInstallingUpdate, setIsInstallingUpdate] = useState<boolean>(false);
+  const [downloadProgress, setDownloadProgress] = useState<number>(0);
+  const [installStatus, setInstallStatus] = useState<string>("Téléchargement de la mise à jour…");
+
+  const handleCheckUpdateManual = async () => {
+    setIsCheckingUpdate(true);
+    try {
+      const info = await invoke<UpdateCheckInfo>("check_for_updates");
+      if (info.updateAvailable) {
+        setUpdateInfo(info);
+        setIsUpdateModalOpen(true);
+      } else {
+        setUpdateInfo(null);
+        showToast(`HardRecover est à jour (${info.currentVersion})`);
+      }
+    } catch (err) {
+      showToast("Impossible de vérifier les mises à jour (vérifiez la connexion)");
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  };
+
+  const handleApplyUpdate = async () => {
+    if (!updateInfo) return;
+    setIsInstallingUpdate(true);
+    setInstallStatus("Téléchargement de la mise à jour…");
+    setDownloadProgress(0);
+
+    const unlisten = await listen<number>("update-download-progress", (event) => {
+      const p = Math.round(event.payload);
+      setDownloadProgress(p);
+      if (p >= 100) {
+        setInstallStatus("Installation et redémarrage automatique…");
+      }
+    });
+
+    try {
+      await invoke("install_update", {
+        downloadUrl: updateInfo.downloadUrl,
+        assetSize: updateInfo.assetSize,
+        assetUpdatedAt: updateInfo.assetUpdatedAt,
+      });
+    } catch (err) {
+      unlisten();
+      setIsInstallingUpdate(false);
+      setErrorBanner(`Erreur mise à jour : ${err}`);
+    }
+  };
+
+  useEffect(() => {
+    // Silent check on launch
+    invoke<UpdateCheckInfo>("check_for_updates")
+      .then((info) => {
+        if (info && info.updateAvailable) {
+          setUpdateInfo(info);
+        }
+      })
+      .catch((e) => console.log("Recherche silencieuse mise à jour:", e));
+  }, []);
 
   const showToast = useCallback((msg: string) => {
     setStatusToast(msg);
@@ -989,6 +1057,26 @@ export default function App() {
           <span className="font-semibold text-sm tracking-tight text-[#EDEDEC]">
             HardRecover
           </span>
+          <button
+            onClick={handleCheckUpdateManual}
+            disabled={isCheckingUpdate}
+            title="Vérifier les mises à jour"
+            className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#252525] hover:bg-[#2F2F2F] text-[#9B9A97] hover:text-[#EDEDEC] border border-[#2F2F2F] transition-colors cursor-pointer flex items-center gap-1"
+          >
+            {isCheckingUpdate && (
+              <RefreshCw className="w-2.5 h-2.5 animate-spin text-[#3B82F6]" />
+            )}
+            <span>v1.0.0</span>
+          </button>
+          {updateInfo?.updateAvailable && (
+            <button
+              onClick={() => setIsUpdateModalOpen(true)}
+              className="flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full bg-[#10B981]/15 hover:bg-[#10B981]/25 text-[#10B981] border border-[#10B981]/30 transition-colors cursor-pointer animate-pulse"
+            >
+              <Sparkles className="w-3 h-3" />
+              <span>Mise à jour disponible ({updateInfo.latestVersion})</span>
+            </button>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -1822,10 +1910,10 @@ export default function App() {
                                   }`}
                                 >
                                   {item.healthBadge === "needs_repair" || item.needsSurgicalRepair
-                                    ? "🟡 Entête à Réparer"
+                                    ? "Entête à Réparer"
                                     : item.healthBadge === "corrupted"
-                                    ? "🔴 Partiellement Écrasé"
-                                    : "🟢 100 % Intègre"}
+                                    ? "Partiellement Écrasé"
+                                    : "100 % Intègre"}
                                 </span>
                               </div>
                             </div>
@@ -2197,8 +2285,9 @@ export default function App() {
 
                       {referenceFile ? (
                         <div className="p-2.5 rounded-lg bg-[#222222] border border-[#10B981]/30 space-y-1">
-                          <div className="text-xs font-semibold text-[#34D399] truncate">
-                            ✓ {referenceFile.fileName}
+                          <div className="text-xs font-semibold text-[#34D399] truncate flex items-center gap-1.5">
+                            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                            <span>{referenceFile.fileName}</span>
                           </div>
                           <div className="text-[11px] text-[#9B9A97] font-mono">
                             {referenceFile.summary}
@@ -2543,8 +2632,9 @@ export default function App() {
                   {surfaceReport ? (
                     <div className="space-y-3">
                       <div className="p-3 rounded-xl bg-[#191919] border border-[#10B981]/30 space-y-1">
-                        <div className="text-xs font-bold text-[#34D399]">
-                          ✓ {surfaceReport.smartStatus}
+                        <div className="text-xs font-bold text-[#34D399] flex items-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                          <span>{surfaceReport.smartStatus}</span>
                         </div>
                         <div className="text-[11px] text-[#9B9A97]">
                           {surfaceReport.counterfeitNote}
@@ -2895,7 +2985,7 @@ export default function App() {
                               ) : (
                                 <>
                                   <AlertCircle className="w-3.5 h-3.5" />
-                                  <span>🚨 Cloner d'Urgence en Image (.img)</span>
+                                  <span>Cloner d'Urgence en Image (.img)</span>
                                 </>
                               )}
                             </button>
@@ -2913,7 +3003,7 @@ export default function App() {
                               ) : (
                                 <>
                                   <ShieldCheck className="w-3.5 h-3.5" />
-                                  <span>🛡️ Réhabiliter le Support (1 Partition Saine)</span>
+                                  <span>Réhabiliter le Support (1 Partition Saine)</span>
                                 </>
                               )}
                             </button>
@@ -2931,7 +3021,7 @@ export default function App() {
                               ) : (
                                 <>
                                   <Zap className="w-3.5 h-3.5 fill-current" />
-                                  <span>⚡ Régénérer le Support (Rafraîchir les charges)</span>
+                                  <span>Régénérer le Support (Rafraîchir les charges)</span>
                                 </>
                               )}
                             </button>
@@ -2991,7 +3081,7 @@ export default function App() {
                             <ul className="space-y-1 text-[11px] text-[#9B9A97] font-mono">
                               {quarantineResult.stepsPerformed.map((step, idx) => (
                                 <li key={idx} className="flex items-center gap-1.5 text-[#A3E635]">
-                                  <span>✓</span>
+                                  <CheckSquare className="w-3 h-3 shrink-0" />
                                   <span className="text-[#C5C5C4]">{step}</span>
                                 </li>
                               ))}
@@ -3047,7 +3137,7 @@ export default function App() {
                             <ul className="space-y-1 text-[11px] text-[#9B9A97] font-mono">
                               {regenerationResult.details.map((step, idx) => (
                                 <li key={idx} className="flex items-center gap-1.5 text-[#34D399]">
-                                  <span>✓</span>
+                                  <CheckSquare className="w-3 h-3 shrink-0" />
                                   <span className="text-[#C5C5C4]">{step}</span>
                                 </li>
                               ))}
@@ -3313,6 +3403,108 @@ export default function App() {
                 className="px-4 py-1.5 rounded-lg bg-[#3B82F6] hover:bg-[#2563EB] text-white font-semibold text-xs transition-colors cursor-pointer"
               >
                 Fermer
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= IN-APP AUTO-UPDATER MODAL ================= */}
+      {isUpdateModalOpen && updateInfo && (
+        <div className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-6 animate-fadeIn">
+          <div className="bg-[#1E1E1E] border border-[#333333] rounded-2xl max-w-lg w-full flex flex-col shadow-2xl overflow-hidden">
+            {/* MODAL HEADER */}
+            <div className="px-6 py-4 border-b border-[#2C2C2C] flex items-center justify-between bg-[#232323]">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-xl bg-blue-600/20 text-blue-400 border border-blue-500/30">
+                  <ArrowDownToLine className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-[#EDEDEC]">
+                    Mise à jour disponible
+                  </h3>
+                  <p className="text-[11px] text-[#9B9A97]">
+                    {updateInfo.releaseName || updateInfo.latestVersion} • {formatBytes(updateInfo.assetSize)}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={isInstallingUpdate}
+                onClick={() => setIsUpdateModalOpen(false)}
+                className="text-[#888888] hover:text-[#EDEDEC] p-1.5 rounded-lg hover:bg-[#2A2A2A] transition-colors disabled:opacity-30 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* MODAL BODY */}
+            <div className="p-6 space-y-4 max-h-[60vh] overflow-y-auto">
+              <div className="flex items-center justify-between text-xs bg-[#161616] p-3 rounded-xl border border-[#2B2B2B]">
+                <div>
+                  <span className="text-[#888888] block text-[10px]">Version actuelle</span>
+                  <span className="font-semibold text-[#EDEDEC] font-mono">{updateInfo.currentVersion}</span>
+                </div>
+                <ArrowRight className="w-4 h-4 text-[#555555]" />
+                <div>
+                  <span className="text-blue-400 block text-[10px] font-semibold">Nouvelle version</span>
+                  <span className="font-bold text-blue-400 font-mono">{updateInfo.latestVersion}</span>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <span className="text-[11px] font-semibold text-[#888888] uppercase tracking-wider block">
+                  Résumé des nouveautés
+                </span>
+                <div className="bg-[#161616] p-3.5 rounded-xl border border-[#2A2A2A] text-xs text-[#D1D5DB] leading-relaxed max-h-56 overflow-y-auto whitespace-pre-wrap font-sans">
+                  {updateInfo.releaseNotes}
+                </div>
+              </div>
+
+              {/* PROGRESS BAR WHILE INSTALLING */}
+              {isInstallingUpdate && (
+                <div className="space-y-2 pt-2 bg-[#171717] p-3.5 rounded-xl border border-blue-500/20">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-blue-300 font-medium">{installStatus}</span>
+                    <span className="font-mono text-blue-400 font-bold">{downloadProgress}%</span>
+                  </div>
+                  <div className="w-full bg-[#111111] h-2 rounded-full overflow-hidden border border-[#2A2A2A]">
+                    <div
+                      className="bg-gradient-to-r from-blue-500 to-indigo-500 h-full transition-all duration-150"
+                      style={{ width: `${downloadProgress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* MODAL ACTIONS */}
+            <div className="px-6 py-4 bg-[#191919] border-t border-[#2C2C2C] flex items-center justify-end gap-3">
+              <button
+                type="button"
+                disabled={isInstallingUpdate}
+                onClick={() => setIsUpdateModalOpen(false)}
+                className="px-4 py-2 rounded-xl text-xs font-medium text-[#9B9A97] hover:text-[#EDEDEC] hover:bg-[#252525] border border-[#2F2F2F] transition-colors disabled:opacity-40 cursor-pointer"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                disabled={isInstallingUpdate}
+                onClick={handleApplyUpdate}
+                className="px-5 py-2 rounded-xl text-xs font-bold bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white shadow-lg shadow-blue-600/30 border border-blue-400/40 flex items-center gap-2 transition-all disabled:opacity-50 cursor-pointer"
+              >
+                {isInstallingUpdate ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Mise à jour en cours…</span>
+                  </>
+                ) : (
+                  <>
+                    <ArrowDownToLine className="w-3.5 h-3.5" />
+                    <span>Mettre à jour</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

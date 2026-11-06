@@ -3,6 +3,7 @@ pub mod imager_health;
 pub mod math_engine;
 pub mod media_repair;
 pub mod settings_history;
+pub mod updater;
 pub mod volumes;
 
 use carver::{
@@ -374,6 +375,8 @@ pub fn run() {
             update_app_settings,
             get_saved_sessions,
             delete_saved_session,
+            updater::check_for_updates,
+            updater::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running HardRecover application");

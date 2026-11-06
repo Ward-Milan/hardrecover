@@ -308,7 +308,7 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
  [Sonde 1] ---- [Sonde 2] ---- [Sonde 3] ... ---- [Sonde 240]
      │              │              │                    │
   < 1 ms         1-5 ms        5-50 ms                > 50 ms
- [🟢 Sain]     [🔵 Normal]    [🟡 Fatigue]         [🔴 Critique]
+ [Sain]         [Normal]       [Fatigue]            [Critique]
                                    │                    │
                   Déclenche : [Outil 9: Refresh]   [Outil 8: Quarantaine]`,
       benefits: [
