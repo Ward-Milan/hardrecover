@@ -278,27 +278,27 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool7: {
     id: "tool7",
     number: "Outil 7",
-    title: "Latence Cellulaire NAND & Test Anti-Contrefaçon",
-    badge: "Sonde LBA Modulo 2ᵏ & Détection Bit-Rot",
+    title: "Latence de Surface & Test Anti-Contrefaçon (NAND & HDD)",
+    badge: "Sonde LBA Modulo 2ᵏ • Détection Bit-Rot & Pistes Fatiguées",
     accentColor: "text-[#60A5FA]",
     bgLightColor: "bg-[#3B82F6]/15 text-[#60A5FA] border-[#3B82F6]/30",
     simpleExplanation:
-      "Cet outil mesure la santé de votre carte mémoire ou SSD et vérifie qu'il ne s'agit pas d'une arnaque. Il mesure le temps de réaction de la mémoire flash pour détecter l'usure invisible (bit-rot) avant qu'une panne ne survienne, et vérifie que la capacité indiquée sur l'emballage est bien réelle.",
+      "Cet outil mesure la santé réelle de votre support (carte SD, SSD, NVMe ou disque dur HDD) et vérifie qu'il ne s'agit pas d'une contrefaçon. Il mesure le temps de réponse physique en microsecondes pour détecter l'usure invisible bien avant la panne (fatigue de charge électrique sur mémoire flash ou micro-blocages de têtes sur HDD), et s'assure que la capacité annoncée est authentique.",
     technicalDetails: {
       overview:
-        "Sondage de surface non destructif en 240 points LBA réguliers via des lectures directes POSIX `pread()` non mises en cache (`F_NOCACHE`). Mesure la latence microseconde (µs) et démasque les cartes contrefaites.",
+        "Sondage de surface non destructif en 240 points LBA réguliers via des lectures directes POSIX `pread()` non mises en cache (`F_NOCACHE`). Différencie automatiquement la mémoire Flash électronique (latence de grille flottante) des disques mécaniques HDD (latence de piste magnétique et repositionnement de tête).",
       keyMechanisms: [
         {
-          title: "Classification de Santé par Latence Flash",
-          desc: "• Vert (< 1 ms) : Cellules neuves et saines.\n• Bleu (1 à 5 ms) : État normal.\n• Jaune (5 à 50 ms) : Fatigue cellulaire. Le contrôleur s'y reprend à plusieurs fois avec le code correcteur LDPC (signe avant-coureur de mort imminente).\n• Rouge (> 50 ms ou Timeout) : Cellule morte ou secteur défectueux.",
+          title: "Classification Flash (SD / SSD / NVMe) vs HDD (Plateaux)",
+          desc: "• Vert (< 1 ms) : Cellules Flash ou pistes HDD saines et réactives.\n• Bleu (1 à 5 ms) : Temps d'accès nominal.\n• Jaune (5 à 50 ms) : Fatigue matérielle. Sur Flash : perte progressive de charge électrique et réessais LDPC. Sur HDD : affaiblissement de flux magnétique et réessais de positionnement de tête.\n• Rouge (> 50 ms ou Timeout) : Cellule flash morte ou secteur LBA défectueux (Bad Sector).",
         },
         {
           title: "Test Anti-Contrefaçon par Sonde Modulo 2ᵏ",
-          desc: "Les fausses cartes SD (ex. vendues pour 1 To mais n'ayant que 32 Go) modifient le firmware pour boucler les écritures au-delà de leur capacité réelle. HardRecover sonde les adresses hautes et vérifie l'absence de rebouclage cyclique.",
+          desc: "Les fausses cartes mémoires ou disques trafiqués modifient le firmware pour faire boucler les adresses au-delà de leur capacité réelle. HardRecover sonde les frontières de clusters hauts et vérifie l'absence de rebouclage cyclique.",
         },
         {
           title: "Micro-Scan Chirurgical Automatique",
-          desc: "Si une sonde détecte de la fatigue ou un secteur lent, le moteur lance automatiquement un zoom secteur par secteur sur la tranche de 16 Mo concernée pour localiser la panne au secteur près.",
+          desc: "Dès qu'une sonde relève une latence anormale (jaune ou rouge), le moteur zoome automatiquement sur la tranche concernée (secteur par secteur) pour localiser la panne avec une précision chirurgicale.",
         },
       ],
       diagram: `+-------------------------------------------------------------+
@@ -312,9 +312,9 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
                                    │                    │
                   Déclenche : [Outil 9: Refresh]   [Outil 8: Quarantaine]`,
       benefits: [
-        "Détecte la dégradation d'une carte mémoire des mois avant la perte de données.",
-        "Prouve immédiatement l'authenticité ou la contrefaçon d'une carte neuve.",
-        "Totalement non destructif : s'exécute en quelques secondes.",
+        "Détecte la dégradation d'une carte mémoire ou d'un disque dur des mois avant la perte de données.",
+        "Prouve immédiatement l'authenticité ou la contrefaçon d'un support neuf.",
+        "Totalement non destructif : s'exécute en quelques secondes en lecture seule pure.",
       ],
     },
   },
@@ -322,31 +322,31 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool8: {
     id: "tool8",
     number: "Outil 8",
-    title: "Quarantaine des Cellules Mortes & Réhabilitation",
+    title: "Quarantaine des Blocs Défectueux & Réhabilitation",
     badge: "Bad Block Exclusion & Remap d'Allocation",
     accentColor: "text-[#F59E0B]",
     bgLightColor: "bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/30",
     simpleExplanation:
-      "Si votre carte SD ou disque a des secteurs défectueux isolés (blocs rouges) qui provoquent des erreurs d'écriture ou font planter votre caméra, cet outil les condamne et les neutralise définitivement. Votre carte reste en 1 SEULE partition propre compatible avec votre caméra (aucune découpe en deux morceaux). Si le support a trop de blocs morts (réserve matérielle épuisée), HardRecover vous conseille de cloner d'urgence en image .img et de remplacer le support.",
+      "Si votre carte SD, SSD ou disque dur possède des secteurs défectueux isolés (blocs rouges) qui provoquent des erreurs d'écriture ou font planter votre caméra, cet outil les condamne et les neutralise définitivement. Votre support conserve 1 SEULE et unique partition propre reconnue nativement par vos appareils (aucune découpe en deux morceaux). Si la réserve matérielle est épuisée, HardRecover vous oriente vers le clonage d'urgence (.img).",
     technicalDetails: {
       overview:
-        "Isolation physique et logique des blocs NAND défectueux pour réhabiliter un support sans altérer son schéma de partitionnement unique (compatible caméras Sony, Canon, RED, Blackmagic).",
+        "Neutralisation physique et logique des blocs défectueux adaptée à chaque support : exclusion d'Erase Blocks sur mémoire Flash, ou verrouillage de secteurs LBA sur disques magnétiques HDD.",
       keyMechanisms: [
         {
           title: "Garantie Partition Unique (Zéro Découpe)",
-          desc: "Contrairement aux outils de partitionnement classiques qui scindent la carte en deux partitions inutilisables pour les caméras, HardRecover conserve 1 seule partition continue en neutralisant les blocs dans la table d'allocation et au niveau de l'Erase Block matériel.",
+          desc: "Contrairement aux utilitaires classiques qui scindent le support en partitions inutilisables pour les caméras professionnelles, HardRecover conserve une géométrie continue en isolant chirurgicalement les clusters morts dans la table d'allocation.",
         },
         {
-          title: "Verrouillage d'Allocation (Bitmap ExFAT / FAT32)",
-          desc: "Le moteur identifie les clusters précis contenant les secteurs défectueux et les marque comme réservés/défectueux. Ni l'appareil photo ni l'ordinateur ne tenteront plus jamais d'y écrire.",
+          title: "Spécificité Flash : Exclusion d'Erase Block (4 à 16 Mo)",
+          desc: "Dans la mémoire flash NAND, les cellules s'organisent en blocs physiques d'effacement. Isoler le bloc entier empêche la contamination des cellules adjacentes et soulage le contrôleur.",
         },
         {
-          title: "Exclusion d'Erase Block Complet (4 à 16 Mo)",
-          desc: "Dans la mémoire flash NAND, un bloc ne s'efface pas secteur par secteur, mais par blocs physiques de 4 Mo à 16 Mo (Erase Blocks). HardRecover isole la totalité du bloc pour empêcher la contamination des cellules adjacentes.",
+          title: "Spécificité HDD : Exclusion LBA & Protection Mécanique",
+          desc: "Sur les disques à plateaux, le marquage des secteurs défectueux dans le bitmap empêche les têtes de lecture d'atterrir ou de buter sur les zones dégradées du plateau, évitant la propagation de rayures physiques.",
         },
         {
           title: "Seuil de Sécurité & Défaillance Critique",
-          desc: "Si plus de 5 blocs physiques sont morts, la réserve interne (Spare Blocks) du contrôleur est saturée. L'outil bloque toute tentative de réparation illusoire et vous oriente vers le clonage d'urgence (.img).",
+          desc: "Si plus de 5 blocs physiques sont morts, la réserve interne (Spare Blocks) est saturée. L'outil bloque toute tentative de réparation illusoire et vous oriente vers le clonage d'urgence (.img).",
         },
       ],
       diagram: `+-------------------------------------------------------------+
@@ -355,11 +355,11 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
  Carte SD / Disque (1 Seule Partition Continue) :
  [Bloc Sain 1]  [Zone HS Neutralisée (0xFFFFFFF7)]  [Bloc Sain 2]
                           ▲
-       La caméra saute la zone morte sans bloquer.
-  Votre carte reste intacte en 1 seul volume compatible !`,
+       La caméra ou l'OS saute la zone morte sans bloquer.
+  Votre support reste intact en 1 seul volume compatible !`,
       benefits: [
-        "Conserve 1 SEULE partition continue : compatible 100% avec les caméras, drones et enregistreurs.",
-        "Évite de jeter une carte SD ou un disque qui ne possède que quelques blocs isolés défaillants.",
+        "Conserve 1 SEULE partition continue : compatible 100% avec les caméras, enregistreurs et ordinateurs.",
+        "Évite de jeter un support qui ne présente que quelques secteurs défaillants isolés.",
         "Détecte la saturation de réserve pour vous avertir avant la perte irrémédiable de données.",
       ],
     },
@@ -368,23 +368,23 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool9: {
     id: "tool9",
     number: "Outil 9",
-    title: "Régénération Cellulaire NAND (Charge Refresh)",
+    title: "Régénération de Surface (Charge Refresh Flash & Remagnétisation HDD)",
     badge: "Zéro Risque Matériel • Zéro Perte de Données",
     accentColor: "text-[#FBBF24]",
     bgLightColor: "bg-[#F59E0B]/15 text-[#FBBF24] border-[#F59E0B]/30",
     simpleExplanation:
-      "La mémoire flash stocke vos données sous la forme de microscopiques charges électriques. Avec le temps et la chaleur, ces charges faiblissent, ce qui ralentit considérablement la lecture (cellules jaunes). Cet outil lit les données en mémoire, élimine les tensions parasites et réinjecte des électrons frais à pleine puissance. Votre carte redevient instantanément aussi rapide qu'au premier jour, sans risque pour vos fichiers.",
+      "La mémoire flash stocke les données sous forme de charges électriques qui faiblissent avec le temps et la chaleur. Les disques durs HDD stockent les bits sous forme d'orientation magnétique qui s'atténue avec l'usure. Cet outil applique un protocole non destructif adapté : rafraîchissement des niveaux de tension électrique pour les cartes SD/SSD, ou remagnétisation dynamique des pistes LBA pour les HDD. Votre support retrouve sa vitesse d'origine sous 1 ms, sans aucun risque pour vos fichiers.",
     technicalDetails: {
       overview:
-        "Protocole de ré-étalonnage électrique non destructif ('Read-Verify-Refresh') restaurant la tension de grille flottante des cellules flash fatiguées.",
+        "Protocole d'étalonnage physique non destructif ('Read-Verify-Refresh') restaurant la tension des grilles flash ou la rémanence magnétique des pistes HDD.",
       keyMechanisms: [
         {
           title: "Cycle Atomique 'Read-Verify-Refresh'",
-          desc: "1. Lecture atomique du bloc LBA fatigué dans la mémoire vive tampon (RAM).\n2. Vérification rigoureuse de l'intégrité via checksum CRC32.\n3. Réécriture immédiate avec forçage de synchronisation matérielle (`F_FULLFSYNC` / `fsync`).\n4. Le contrôleur flash réinjecte des électrons à tension nominale maximale, ce qui remet à zéro les compteurs d'erreurs LDPC du matériel.",
+          desc: "1. Lecture atomique du secteur fatigué dans la mémoire vive tampon (RAM).\n2. Vérification rigoureuse de l'intégrité via checksum CRC32.\n3. Réécriture immédiate avec forçage de synchronisation matérielle (`F_FULLFSYNC` / `fsync`).\n4. Sur Flash : le contrôleur réinjecte des électrons à tension nominale. Sur HDD : la tête d'écriture remagnétise les domaines magnétiques affaiblis avec purge du cache.",
         },
         {
           title: "Restauration Immédiate de la Latence (< 1 ms)",
-          desc: "Les cellules fatiguées qui mettaient entre 5 et 50 ms à répondre retombent instantanément sous la barre des 1000 µs (Vert).",
+          desc: "Les secteurs fatigués qui mettaient entre 5 et 50 ms à répondre retombent instantanément sous la barre des 1000 µs (Vert), éliminant les réessais intempestifs.",
         },
         {
           title: "Zéro Risque Matériel & Zéro Perte",

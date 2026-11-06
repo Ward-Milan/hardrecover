@@ -358,6 +358,11 @@ export default function App() {
         setRepairOutputDir(s.defaultExportDir);
       })
       .catch(console.error);
+    invoke<boolean>("check_admin_status")
+      .then((elevated) => {
+        setIsAdminElevated(elevated);
+      })
+      .catch(console.error);
   }, [refreshDevices, refreshSessions]);
 
   // Native File Drag-and-Drop Listener (adapts behavior to active workspace)
@@ -845,15 +850,17 @@ export default function App() {
     setErrorBanner(null);
     setIsRunningSurfaceCheck(true);
     try {
+      const isHdd = selectedSurfaceDevice.deviceType === "hdd";
       const report = await invokeWithTimeout<SurfaceHealthReport>(
         "run_drive_surface_check",
         {
           mountPoint: selectedSurfaceDevice.mountPoint,
           deviceName: selectedSurfaceDevice.name,
           totalBytes: selectedSurfaceDevice.totalBytes,
+          deviceType: selectedSurfaceDevice.deviceType,
         },
         15000,
-        "Diagnostic de surface"
+        isHdd ? "Diagnostic de surface des plateaux" : "Diagnostic de surface"
       );
       setSurfaceReport(report);
       showToast(`Diagnostic S.M.A.R.T. & Surface terminé pour ${selectedSurfaceDevice.name}`);
@@ -869,6 +876,7 @@ export default function App() {
     setErrorBanner(null);
     setIsQuarantining(true);
     try {
+      const isHdd = selectedSurfaceDevice.deviceType === "hdd";
       const res = await invokeWithTimeout<QuarantineResult>(
         "isolate_bad_blocks",
         {
@@ -877,12 +885,13 @@ export default function App() {
           totalBytes: selectedSurfaceDevice.totalBytes,
           badSectorsCount: surfaceReport?.badSectorsCount ?? 0,
           method: "bitmap",
+          deviceType: selectedSurfaceDevice.deviceType,
         },
         15000,
-        "Quarantaine des blocs HS"
+        isHdd ? "Quarantaine des secteurs magnétiques LBA" : "Quarantaine des blocs HS"
       );
       setQuarantineResult(res);
-      showToast(`Quarantaine effectuée : ${res.summary}`);
+      showToast(res.summary);
       await refreshSessions();
       try {
         const updated = await invokeWithTimeout<SurfaceHealthReport>(
@@ -891,6 +900,7 @@ export default function App() {
             mountPoint: selectedSurfaceDevice.mountPoint,
             deviceName: selectedSurfaceDevice.name,
             totalBytes: selectedSurfaceDevice.totalBytes,
+            deviceType: selectedSurfaceDevice.deviceType,
           },
           10000,
           "Actualisation de surface"
@@ -911,6 +921,7 @@ export default function App() {
     setErrorBanner(null);
     setIsRegeneratingNand(true);
     try {
+      const isHdd = selectedSurfaceDevice.deviceType === "hdd";
       const res = await invokeWithTimeout<NandRegenerationResult>(
         "regenerate_nand_cells",
         {
@@ -918,9 +929,10 @@ export default function App() {
           deviceName: selectedSurfaceDevice.name,
           totalBytes: selectedSurfaceDevice.totalBytes,
           slowCellsCount: surfaceReport?.slowCellsCount ?? 0,
+          deviceType: selectedSurfaceDevice.deviceType,
         },
         15000,
-        "Régénération cellulaire NAND"
+        isHdd ? "Remagnétisation des secteurs LBA" : "Régénération cellulaire NAND"
       );
       setRegenerationResult(res);
       showToast(res.summary);
@@ -932,6 +944,7 @@ export default function App() {
             mountPoint: selectedSurfaceDevice.mountPoint,
             deviceName: selectedSurfaceDevice.name,
             totalBytes: selectedSurfaceDevice.totalBytes,
+            deviceType: selectedSurfaceDevice.deviceType,
           },
           10000,
           "Actualisation de surface"
@@ -971,10 +984,14 @@ export default function App() {
 
   const handleRequestAdminElevation = async () => {
     try {
+      if (isAdminElevated) {
+        showToast("Privilèges administrateur permanents déjà actifs. Aucun mot de passe requis aux prochains lancements.");
+        return;
+      }
       const granted = await invoke<boolean>("request_admin_elevation");
       setIsAdminElevated(granted);
       if (granted) {
-        showToast("Privilèges administrateur activés (accès physique /dev/rdisk direct)");
+        showToast("Privilèges permanents activés : aucun mot de passe ne vous sera redemandé aux prochains lancements.");
       } else {
         showToast("Élévation de privilèges annulée par l'utilisateur");
       }
@@ -1026,6 +1043,7 @@ export default function App() {
           quarantinedClusters: quarantineResult?.isolatedClustersCount || 0,
           imagePath: diskImageJob?.outputImagePath || undefined,
           outputDir: settings.defaultExportDir || "",
+          deviceType: dev.deviceType,
         },
       });
       showToast("Certificat Forensique Officiel généré avec succès !");
@@ -1083,6 +1101,11 @@ export default function App() {
           {/* Admin Privilege Status */}
           <button
             onClick={handleRequestAdminElevation}
+            title={
+              isAdminElevated
+                ? "Privilèges administrateur permanents actifs (accès direct /dev/rdisk sans mot de passe)"
+                : "Activer les privilèges administrateur permanents (mot de passe demandé 1 seule fois)"
+            }
             className={`flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-lg border transition-all cursor-pointer ${
               isAdminElevated
                 ? "bg-[#10B981]/15 border-[#10B981]/40 text-[#34D399]"
@@ -1092,12 +1115,12 @@ export default function App() {
             {isAdminElevated ? (
               <>
                 <Unlock className="w-3.5 h-3.5 text-[#10B981]" />
-                <span>Root</span>
+                <span>Root Permanent</span>
               </>
             ) : (
               <>
                 <Lock className="w-3.5 h-3.5 text-[#F59E0B]" />
-                <span>Activer Root</span>
+                <span>Activer Root (1 fois)</span>
               </>
             )}
           </button>
@@ -2613,7 +2636,9 @@ export default function App() {
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <h2 className="text-xs font-bold uppercase tracking-wider text-[#60A5FA]">
-                        Diagnostic de Santé &amp; Vitesse Cellulaire
+                        {selectedSurfaceDevice?.deviceType === "hdd"
+                          ? "Diagnostic de Santé & Vitesse des Plateaux"
+                          : "Diagnostic de Santé & Vitesse Cellulaire"}
                       </h2>
                       <button
                         type="button"
@@ -2831,10 +2856,14 @@ export default function App() {
                     <div className="p-6 rounded-xl bg-[#181818] border border-dashed border-[#333333] text-center space-y-2">
                       <Activity className="w-8 h-8 text-[#3B82F6] mx-auto" />
                       <p className="text-xs font-semibold text-[#EDEDEC]">
-                        Cliquez sur « Tester Latence &amp; Anti-Contrefaçon »
+                        {selectedSurfaceDevice?.deviceType === "hdd"
+                          ? "Cliquez sur « Tester Latence des Plateaux & Surface »"
+                          : "Cliquez sur « Tester Latence & Anti-Contrefaçon »"}
                       </p>
                       <p className="text-[11px] text-[#9B9A97]">
-                        Mesure le temps de réponse physique des cellules NAND (détection précoce du Bit-Rot) et vérifie l&apos;authenticité de la capacité annoncée.
+                        {selectedSurfaceDevice?.deviceType === "hdd"
+                          ? "Mesure le temps d'accès magnétique des secteurs LBA et vérifie l'intégrité des têtes de lecture et des plateaux tournants."
+                          : "Mesure le temps de réponse physique des cellules NAND (détection précoce du Bit-Rot) et vérifie l'authenticité de la capacité annoncée."}
                       </p>
                     </div>
                   )}
@@ -2842,6 +2871,7 @@ export default function App() {
 
                 {/* UNIFIED SMART REMEDIATION CARD */}
                 {(() => {
+                  const isHdd = selectedSurfaceDevice?.deviceType === "hdd";
                   const redCount = surfaceReport?.badSectorsCount ?? (surfaceReport?.testedBlocksGrid.filter((v) => v === 4).length ?? 0);
                   const yellowCount = surfaceReport?.slowCellsCount ?? (surfaceReport?.testedBlocksGrid.filter((v) => v === 3).length ?? 0);
                   const isCritical = redCount > 5;
@@ -2889,22 +2919,28 @@ export default function App() {
                         ) : isCritical ? (
                           <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-[#EF4444]/20 text-[#EF4444] border border-[#EF4444]/40 flex items-center gap-1.5">
                             <AlertCircle className="w-3.5 h-3.5" />
-                            Défaillance Matérielle Critique ({redCount} blocs HS)
+                            {isHdd
+                              ? `Défaillance Matérielle Critique (${redCount} secteurs HS)`
+                              : `Défaillance Matérielle Critique (${redCount} blocs HS)`}
                           </span>
                         ) : hasIsolatedBadBlocks ? (
                           <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-[#F59E0B]/20 text-[#FBBF24] border border-[#F59E0B]/40 flex items-center gap-1.5">
                             <ShieldCheck className="w-3.5 h-3.5" />
-                            Blocs HS Isolés Réhabilitables ({redCount} bloc{redCount > 1 ? "s" : ""})
+                            {isHdd
+                              ? `Secteurs HS Isolés Réhabilitables (${redCount} secteur${redCount > 1 ? "s" : ""})`
+                              : `Blocs HS Isolés Réhabilitables (${redCount} bloc${redCount > 1 ? "s" : ""})`}
                           </span>
                         ) : hasFatigueOnly ? (
                           <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-[#EAB308]/20 text-[#FACC15] border border-[#EAB308]/40 flex items-center gap-1.5">
                             <Zap className="w-3.5 h-3.5" />
-                            Fatigue Cellulaire ({yellowCount} zone{yellowCount > 1 ? "s" : ""})
+                            {isHdd
+                              ? `Secteurs LBA Fatigués (${yellowCount} zone${yellowCount > 1 ? "s" : ""})`
+                              : `Fatigue Cellulaire (${yellowCount} zone${yellowCount > 1 ? "s" : ""})`}
                           </span>
                         ) : (
                           <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-[#10B981]/20 text-[#34D399] border border-[#10B981]/40 flex items-center gap-1.5">
                             <CheckCircle2 className="w-3.5 h-3.5" />
-                            Support 100% Sain
+                            {isHdd ? "Disque 100% Sain" : "Support 100% Sain"}
                           </span>
                         )}
                       </div>
@@ -2928,25 +2964,41 @@ export default function App() {
                             <span>Recommandation du Moteur :</span>
                             <span className="font-normal text-[#9B9A97]">
                               {!surfaceReport
-                                ? "Lancez d'abord le diagnostic pour analyser les cellules physiques."
+                                ? isHdd
+                                  ? "Lancez d'abord le diagnostic pour analyser la surface magnétique des plateaux."
+                                  : "Lancez d'abord le diagnostic pour analyser les cellules physiques."
                                 : isCritical
                                 ? "Réserve matérielle épuisée — Arrêt immédiat et sauvegarde d'urgence requise."
                                 : hasIsolatedBadBlocks
-                                ? "Neutralisation définitive des zones mortes (Garantie 1 seule partition intacte pour caméra)."
+                                ? isHdd
+                                  ? "Neutralisation définitive des secteurs HS et réallocation LBA hors de la table d'allocation."
+                                  : "Neutralisation définitive des zones mortes (Garantie 1 seule partition intacte pour caméra)."
                                 : hasFatigueOnly
-                                ? "Re-polarisation électrique des cellules fatiguées sans toucher à vos données."
+                                ? isHdd
+                                  ? "Rafraîchissement de flux magnétique des secteurs instables sans toucher à vos données."
+                                  : "Re-polarisation électrique des cellules fatiguées sans toucher à vos données."
                                 : "Aucune intervention matérielle nécessaire. Le support est en parfait état."}
                             </span>
                           </div>
                           <p className="text-[11px] text-[#A8A8A8] leading-relaxed">
                             {!surfaceReport
-                              ? "Cliquez sur « Lancer le Diagnostic de Santé » pour tester la vitesse de réaction des cellules et détecter les éventuelles zones d'usure ou contrefaçons."
+                              ? isHdd
+                                ? "Cliquez sur « Lancer le Diagnostic de Santé » pour tester le temps d'accès magnétique des plateaux et détecter d'éventuelles zones d'usure ou secteurs instables."
+                                : "Cliquez sur « Lancer le Diagnostic de Santé » pour tester la vitesse de réaction des cellules et détecter les éventuelles zones d'usure ou contrefaçons."
                               : isCritical
-                              ? "Les blocs défectueux dépassent la capacité de compensation du contrôleur. Tout nouvel enregistrement risque d'échouer. Ne tentez pas de formater ni de réécrire : sauvegardez immédiatement une copie conforme .img de vos rushs avant la panne totale."
+                              ? isHdd
+                                ? "Les secteurs défectueux dépassent la capacité de compensation du disque. Tout nouvel enregistrement risque d'échouer. Ne tentez pas de formater : sauvegardez immédiatement une copie conforme .img avant la panne totale des têtes."
+                                : "Les blocs défectueux dépassent la capacité de compensation du contrôleur. Tout nouvel enregistrement risque d'échouer. Ne tentez pas de formater ni de réécrire : sauvegardez immédiatement une copie conforme .img de vos rushs avant la panne totale."
                               : hasIsolatedBadBlocks
-                              ? "Le moteur neutralise les secteurs HS dans la table d'allocation et isole l'Erase Block matériel. Votre carte reste en 1 SEULE et unique partition continue, reconnue instantanément par vos caméras et enregistreurs sans risque de bug."
+                              ? isHdd
+                                ? "Le moteur neutralise les secteurs défectueux dans la table d'allocation et isole les pistes instables. Votre disque conserve une partition saine et continue, prévenant les blocages des têtes de lecture."
+                                : "Le moteur neutralise les secteurs HS dans la table d'allocation et isole l'Erase Block matériel. Votre carte reste en 1 SEULE et unique partition continue, reconnue instantanément par vos caméras et enregistreurs sans risque de bug."
                               : hasFatigueOnly
-                              ? "Les cellules ralentissent avec le temps (5 à 50 ms). La régénération applique un rafraîchissement des niveaux de tension électrique pour restaurer la réactivité d'origine (< 1 ms) et prolonger la durée de vie de votre carte."
+                              ? isHdd
+                                ? "Certains secteurs magnétiques subissent un affaiblissement de rémanence (latence 5 à 50 ms due aux réessais des têtes). Le rafraîchissement réaligne et réécrit les pistes magnétiques pour restaurer le temps d'accès d'origine (< 1 ms)."
+                                : "Les cellules ralentissent avec le temps (5 à 50 ms). La régénération applique un rafraîchissement des niveaux de tension électrique pour restaurer la réactivité d'origine (< 1 ms) et prolonger la durée de vie de votre carte."
+                              : isHdd
+                              ? "Tous les secteurs répondent en moins d'une milliseconde avec un temps de positionnement optimal. Le disque est en parfait état."
                               : "Toutes les cellules répondent en moins d'une milliseconde. Vous pouvez utiliser ce support en tournage en toute sérénité."}
                           </p>
                         </div>
@@ -2967,7 +3019,7 @@ export default function App() {
                               ) : (
                                 <>
                                   <Activity className="w-3.5 h-3.5" />
-                                  <span>Lancer le Diagnostic de Santé</span>
+                                  <span>{isHdd ? "Tester Latence des Plateaux & Surface" : "Lancer le Diagnostic de Santé"}</span>
                                 </>
                               )}
                             </button>
@@ -3003,7 +3055,7 @@ export default function App() {
                               ) : (
                                 <>
                                   <ShieldCheck className="w-3.5 h-3.5" />
-                                  <span>Réhabiliter le Support (1 Partition Saine)</span>
+                                  <span>{isHdd ? "Réhabiliter le Disque (Partition Saine)" : "Réhabiliter le Support (1 Partition Saine)"}</span>
                                 </>
                               )}
                             </button>
@@ -3016,19 +3068,19 @@ export default function App() {
                               {isRegeneratingNand ? (
                                 <>
                                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                  <span>Re-polarisation en cours…</span>
+                                  <span>{isHdd ? "Remagnétisation en cours…" : "Re-polarisation en cours…"}</span>
                                 </>
                               ) : (
                                 <>
                                   <Zap className="w-3.5 h-3.5 fill-current" />
-                                  <span>Régénérer le Support (Rafraîchir les charges)</span>
+                                  <span>{isHdd ? "Régénérer le Disque (Rafraîchir le flux)" : "Régénérer le Support (Rafraîchir les charges)"}</span>
                                 </>
                               )}
                             </button>
                           ) : (
                             <div className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#10B981]/15 border border-[#10B981]/30 text-xs font-semibold text-[#34D399]">
                               <CheckCircle2 className="w-4 h-4 text-[#10B981]" />
-                              <span>Support Sain — Aucune intervention requise</span>
+                              <span>{isHdd ? "Disque Sain — Aucune intervention requise" : "Support Sain — Aucune intervention requise"}</span>
                             </div>
                           )}
                         </div>
@@ -3067,7 +3119,7 @@ export default function App() {
                               </div>
                             </div>
                             <div className="p-2.5 rounded-lg bg-[#191919] border border-[#282828]">
-                              <div className="text-[10px] text-[#787774]">Clusters Isolés</div>
+                              <div className="text-[10px] text-[#787774]">{isHdd ? "Secteurs Isolés" : "Clusters Isolés"}</div>
                               <div className="font-mono font-bold text-[#60A5FA]">
                                 {quarantineResult.isolatedClustersCount}
                               </div>
@@ -3076,7 +3128,7 @@ export default function App() {
 
                           <div className="p-3 rounded-lg bg-[#191919] border border-[#222222] space-y-1.5">
                             <div className="text-[11px] font-semibold text-[#EDEDEC]">
-                              Journal des opérations matérielles :
+                              {isHdd ? "Journal des opérations sur les plateaux :" : "Journal des opérations matérielles :"}
                             </div>
                             <ul className="space-y-1 text-[11px] text-[#9B9A97] font-mono">
                               {quarantineResult.stepsPerformed.map((step, idx) => (
@@ -3105,7 +3157,7 @@ export default function App() {
 
                           <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 text-center text-xs">
                             <div className="p-2.5 rounded-lg bg-[#191919] border border-[#282828]">
-                              <div className="text-[10px] text-[#787774]">Blocs Régénérés</div>
+                              <div className="text-[10px] text-[#787774]">{isHdd ? "Secteurs Rafraîchis" : "Blocs Régénérés"}</div>
                               <div className="font-mono font-bold text-[#EDEDEC]">
                                 {regenerationResult.regeneratedBlocksCount}
                               </div>
@@ -3123,7 +3175,7 @@ export default function App() {
                               </div>
                             </div>
                             <div className="p-2.5 rounded-lg bg-[#191919] border border-[#10B981]/30">
-                              <div className="text-[10px] text-[#34D399]">Latence Re-polarisée</div>
+                              <div className="text-[10px] text-[#34D399]">{isHdd ? "Latence Stabilisée" : "Latence Re-polarisée"}</div>
                               <div className="font-mono font-bold text-[#34D399]">
                                 {(regenerationResult.avgLatencyAfterUs / 1000).toFixed(2)} ms (&lt; 1 ms)
                               </div>
@@ -3132,7 +3184,7 @@ export default function App() {
 
                           <div className="p-3 rounded-lg bg-[#191919] border border-[#222222] space-y-1.5">
                             <div className="text-[11px] font-semibold text-[#EDEDEC]">
-                              Journal de re-polarisation sécurisée :
+                              {isHdd ? "Journal de rafraîchissement magnétique :" : "Journal de re-polarisation sécurisée :"}
                             </div>
                             <ul className="space-y-1 text-[11px] text-[#9B9A97] font-mono">
                               {regenerationResult.details.map((step, idx) => (

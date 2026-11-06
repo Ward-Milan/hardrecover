@@ -15,9 +15,10 @@ use imager_health::{
     check_admin_privileges, create_forensic_disk_image, generate_certified_forensic_report,
     mount_disk_image_readonly, quarantine_damaged_blocks,
     regenerate_fatigued_nand_blocks as regenerate_nand_engine, request_admin_privileges,
-    run_surface_and_health_diagnostic, run_targeted_micro_scan as run_micro_scan_engine,
-    unmount_disk_image, DiskImageJobState, ForensicCertificateRequest, MicroScanResult,
-    MountedImageInfo, NandRegenerationResult, QuarantineResult, SurfaceHealthReport,
+    revoke_admin_privileges, run_surface_and_health_diagnostic,
+    run_targeted_micro_scan as run_micro_scan_engine, unmount_disk_image, DiskImageJobState,
+    ForensicCertificateRequest, MicroScanResult, MountedImageInfo, NandRegenerationResult,
+    QuarantineResult, SurfaceHealthReport,
 };
 use media_repair::{
     generate_demo_corrupted_lab, inspect_and_diagnose_media, inspect_reference_file,
@@ -199,9 +200,10 @@ async fn run_drive_surface_check(
     mount_point: String,
     device_name: String,
     total_bytes: u64,
+    device_type: Option<String>,
 ) -> Result<SurfaceHealthReport, String> {
     tokio::task::spawn_blocking(move || {
-        run_surface_and_health_diagnostic(&mount_point, &device_name, total_bytes)
+        run_surface_and_health_diagnostic(&mount_point, &device_name, total_bytes, device_type.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -214,20 +216,36 @@ async fn isolate_bad_blocks(
     total_bytes: u64,
     bad_sectors_count: u32,
     method: String,
+    device_type: Option<String>,
 ) -> Result<QuarantineResult, String> {
     let dev_name = device_name.clone();
     let mp = mount_point.clone();
+    let dt_clone = device_type.clone();
     let res = tokio::task::spawn_blocking(move || {
-        quarantine_damaged_blocks(&mount_point, &device_name, total_bytes, bad_sectors_count, &method)
+        quarantine_damaged_blocks(
+            &mount_point,
+            &device_name,
+            total_bytes,
+            bad_sectors_count,
+            &method,
+            dt_clone.as_deref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())??;
+
+    let is_hdd = device_type.as_deref() == Some("hdd");
+    let target_label = if is_hdd {
+        format!("Quarantaine LBA ({})", dev_name)
+    } else {
+        format!("Quarantaine NAND ({})", dev_name)
+    };
 
     append_session(SavedSessionEntry {
         id: Uuid::new_v4().to_string(),
         timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         session_type: "recovery".to_string(),
-        target_name: format!("Quarantaine NAND ({})", dev_name),
+        target_name: target_label,
         target_path: mp,
         files_processed: res.isolated_clusters_count as usize,
         total_bytes: res.usable_bytes,
@@ -266,21 +284,30 @@ async fn regenerate_nand_cells(
     device_name: String,
     total_bytes: u64,
     slow_cells_count: u32,
+    device_type: Option<String>,
 ) -> Result<NandRegenerationResult, String> {
     let dev_name = device_name.clone();
     let mp = mount_point.clone();
+    let dt_clone = device_type.clone();
     let res = tokio::task::spawn_blocking(move || {
-        regenerate_nand_engine(&mount_point, &device_name, total_bytes, slow_cells_count)
+        regenerate_nand_engine(&mount_point, &device_name, total_bytes, slow_cells_count, dt_clone.as_deref())
     })
     .await
     .map_err(|e| e.to_string())??;
 
     if res.regenerated_blocks_count > 0 {
+        let is_hdd = device_type.as_deref() == Some("hdd");
+        let target_label = if is_hdd {
+            format!("Remagnétisation ({})", dev_name)
+        } else {
+            format!("Régénération NAND ({})", dev_name)
+        };
+
         append_session(SavedSessionEntry {
             id: Uuid::new_v4().to_string(),
             timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             session_type: "repair".to_string(),
-            target_name: format!("Régénération NAND ({})", dev_name),
+            target_name: target_label,
             target_path: mp,
             files_processed: res.regenerated_blocks_count as usize,
             total_bytes: res.regenerated_bytes,
@@ -340,6 +367,13 @@ async fn request_admin_elevation() -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn revoke_admin_elevation() -> Result<bool, String> {
+    tokio::task::spawn_blocking(revoke_admin_privileges)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn generate_forensic_certificate(request: ForensicCertificateRequest) -> Result<String, String> {
     tokio::task::spawn_blocking(move || generate_certified_forensic_report(&request))
         .await
@@ -370,6 +404,7 @@ pub fn run() {
             unmount_rescue_image,
             check_admin_status,
             request_admin_elevation,
+            revoke_admin_elevation,
             generate_forensic_certificate,
             get_app_settings,
             update_app_settings,
@@ -469,19 +504,24 @@ mod tests {
         let total = 64 * 1024 * 1024 * 1024u64; // 64 GB SD card
 
         // Healthy drive with 0 bad sectors
-        let healthy = quarantine_damaged_blocks("/tmp", "Lexar 1800x SDXC", total, 0, "bitmap")
+        let healthy = quarantine_damaged_blocks("/tmp", "Lexar 1800x SDXC", total, 0, "bitmap", Some("sd_card"))
             .expect("healthy quarantine check failed");
         assert_eq!(healthy.quarantined_bytes, 0);
         assert_eq!(healthy.usable_bytes, total);
 
         // Damaged drive with 2 bad sectors
-        let res = quarantine_damaged_blocks("/tmp", "Lexar 1800x SDXC", total, 2, "bitmap")
+        let res = quarantine_damaged_blocks("/tmp", "Lexar 1800x SDXC", total, 2, "bitmap", Some("sd_card"))
             .expect("quarantine failed");
         assert_eq!(res.original_bytes, total);
         assert!(res.quarantined_bytes > 0);
         assert!(res.usable_bytes < total);
         assert!(res.isolated_clusters_count > 0);
         assert!(!res.steps_performed.is_empty());
+
+        // Damaged HDD with 2 bad sectors
+        let hdd_res = quarantine_damaged_blocks("/tmp", "WD Blue HDD", total, 2, "bitmap", Some("hdd"))
+            .expect("hdd quarantine failed");
+        assert!(hdd_res.summary.contains("Disque"));
     }
 
     #[test]
@@ -501,16 +541,22 @@ mod tests {
         let total = 64 * 1024 * 1024 * 1024u64;
 
         // Healthy card with 0 slow cells
-        let healthy = regenerate_fatigued_nand_blocks("/tmp", "SanDisk Extreme", total, 0)
+        let healthy = regenerate_fatigued_nand_blocks("/tmp", "SanDisk Extreme", total, 0, Some("sd_card"))
             .expect("healthy regen test failed");
         assert_eq!(healthy.regenerated_blocks_count, 0);
 
         // Fatigued card with 2 slow cells
-        let regen = regenerate_fatigued_nand_blocks("/tmp", "SanDisk Extreme", total, 2)
+        let regen = regenerate_fatigued_nand_blocks("/tmp", "SanDisk Extreme", total, 2, Some("sd_card"))
             .expect("regen test failed");
         assert_eq!(regen.regenerated_blocks_count, 2);
         assert!(regen.speedup_factor > 10.0);
         assert!(regen.avg_latency_after_us < regen.avg_latency_before_us);
+
+        // Fatigued HDD with 2 slow LBA sectors
+        let hdd_regen = regenerate_fatigued_nand_blocks("/tmp", "Seagate Expansion HDD", total, 2, Some("hdd"))
+            .expect("hdd regen test failed");
+        assert_eq!(hdd_regen.regenerated_blocks_count, 2);
+        assert!(hdd_regen.summary.contains("secteur(s) magnétique(s)"));
     }
 
     #[test]
@@ -561,6 +607,7 @@ mod tests {
             quarantined_clusters: 0,
             image_path: None,
             output_dir: "/tmp".to_string(),
+            device_type: Some("sd_card".to_string()),
         };
 
         let report_path = generate_certified_forensic_report(&req)
