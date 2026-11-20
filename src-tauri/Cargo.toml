@@ -1,6 +1,6 @@
 [package]
 name = "hardrecover"
-version = "1.0.0"
+version = "1.0.1"
 description = "Open-source forensic drive recovery, file carving and surgical media repair engine"
 authors = ["Hard Suite"]
 edition = "2021"

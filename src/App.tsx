@@ -3350,6 +3350,17 @@ export default function App() {
                   className="w-24 px-2.5 py-1 rounded-lg bg-[#121212] border border-[#333333] font-mono text-right text-[#EDEDEC]"
                 />
               </div>
+
+              {/* Mentions Légales & Responsabilité */}
+              <div className="p-3.5 rounded-xl bg-[#141414] border border-[#262626] space-y-1.5">
+                <div className="flex items-center gap-2 text-xs font-semibold text-[#9B9A97]">
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#10B981]" />
+                  <span>Cadre d&apos;Utilisation &amp; Responsabilité</span>
+                </div>
+                <p className="text-[11px] text-[#787774] leading-relaxed">
+                  HardRecover est un outil forensique professionnel open-source (Licence MIT). Les opérations de lecture bas niveau, d&apos;imagerie et de réhabilitation s&apos;exécutent directement sur vos périphériques physiques. L&apos;utilisateur demeure seul responsable de la manipulation de ses supports matériels et de la sauvegarde préalable de ses données critiques.
+                </p>
+              </div>
             </div>
 
             <div className="flex justify-end pt-2">

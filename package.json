@@ -1,7 +1,7 @@
 {
   "name": "hardrecover",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Open-source forensic drive recovery, file carving & surgical media repair studio",
   "type": "module",
   "scripts": {
@@ -32,4 +32,3 @@
     "vite": "^6.0.3"
   }
 }
-
