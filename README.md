@@ -45,11 +45,9 @@ Le package d'installation autonome macOS (Apple Silicon) est prêt à l'emploi :
 ### Installation sur macOS
 1. Téléchargez et ouvrez **[`HardRecover_1.0.0_macOS.dmg`](https://github.com/Ward-Milan/hardrecover/releases/latest/download/HardRecover_1.0.0_macOS.dmg)** (ou directement depuis le dépôt : [HardRecover_1.0.0_macOS.dmg](HardRecover_1.0.0_macOS.dmg)).
 2. Glissez-déposez **HardRecover.app** dans votre dossier **/Applications**.
-3. *Note Gatekeeper (macOS Sequoia / Tahoe)* : L'application étant open-source (signée ad-hoc sans certificat Apple Developer payant), si macOS bloque l'ouverture après téléchargement via navigateur, exécutez dans le Terminal :
-   ```bash
-   xattr -cr /Applications/HardRecover.app
-   ```
-   (ou autorisez l'application dans *Réglages Système > Confidentialité et sécurité > Ouvrir quand même*).
+3. **Premier lancement (sécurité macOS / Gatekeeper)** : L'application étant open-source et gratuite (sans abonnement payant Apple Developer), macOS peut bloquer sa première ouverture. Pour l'autoriser :
+   - Lancez l'app une première fois, puis allez dans **Réglages Système › Confidentialité et sécurité**, descendez tout en bas et cliquez sur **« Ouvrir quand même »**.
+   - *(En cas de blocage persistant sur macOS Sequoia+, vous pouvez aussi lancer dans le Terminal : `xattr -cr /Applications/HardRecover.app`).*
 
 ---
 
