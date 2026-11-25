@@ -24,6 +24,8 @@ pub struct RecoverableFileItem {
     pub category: String, // "video" | "photo_raw" | "photo_raster" | "audio" | "document" | "other"
     pub folder_path: String,
     pub source_path: Option<String>,
+    #[serde(default)]
+    pub byte_offset: Option<u64>,
     pub size_bytes: u64,
     pub lba_offset: u64,
     pub cluster_count: u64,
@@ -191,9 +193,11 @@ pub fn execute_recovery_scan(
     device_name: &str,
     scan_mode: &str,
 ) -> Result<RecoveryScanJob, String> {
+    let scan_start = std::time::Instant::now();
     let root = Path::new(target_path);
     let mut items: Vec<RecoverableFileItem> = Vec::new();
     let mut total_recoverable_bytes = 0u64;
+    let mut total_scanned_bytes = 0u64;
     let mut current_lba = 2048u64;
 
     let is_demo_mode = scan_mode == "demo" || target_path == "demo";
@@ -363,6 +367,7 @@ pub fn execute_recovery_scan(
                 category: ccat.to_string(),
                 folder_path: cfolder.to_string(),
                 source_path: None,
+                byte_offset: None,
                 size_bytes: csize,
                 lba_offset: current_lba,
                 cluster_count: clusters,
@@ -382,7 +387,7 @@ pub fn execute_recovery_scan(
             total_recoverable_bytes += csize;
         }
     } else if root.exists() && root.is_dir() {
-        // 1. Scan real filesystem / directory if readable
+        // 1. Scan real filesystem / directory (including .Trashes / .Trash)
         let mut scanned_files = 0usize;
         for entry in WalkDir::new(root)
             .max_depth(8)
@@ -399,11 +404,15 @@ pub fn execute_recovery_scan(
             let path = entry.path();
             let fname = entry.file_name().to_string_lossy().to_string();
 
-            // Strict filtering of OS hidden files, Spotlight, Trash, AppleDouble forks
-            if fname.starts_with('.') || fname.starts_with("._") {
+            // Skip macOS AppleDouble / Finder metadata files, while allowing real files inside .Trashes / .Trash
+            if fname == ".DS_Store" || fname.starts_with("._") {
                 continue;
             }
             let path_str = path.to_string_lossy();
+            let is_in_trash = path_str.contains("/.Trashes/") || path_str.contains("/.Trash/");
+            if fname.starts_with('.') && !is_in_trash {
+                continue;
+            }
             if path_str.contains("/.Spotlight-V100")
                 || path_str.contains("/.fseventsd")
                 || path_str.contains("/.TemporaryItems")
@@ -493,6 +502,7 @@ pub fn execute_recovery_scan(
                 category: category.to_string(),
                 folder_path: folder_display,
                 source_path: Some(path.to_string_lossy().to_string()),
+                byte_offset: None,
                 size_bytes: size,
                 lba_offset: current_lba,
                 cluster_count: clusters,
@@ -515,6 +525,7 @@ pub fn execute_recovery_scan(
 
             current_lba += clusters * 8;
             total_recoverable_bytes += size;
+            total_scanned_bytes += size;
             scanned_files += 1;
         }
     } else if root.exists() && root.is_file() {
@@ -522,6 +533,7 @@ pub fn execute_recovery_scan(
         if let Ok(mut f) = File::open(root) {
             let meta = f.metadata().ok();
             let file_size = meta.map(|m| m.len()).unwrap_or(0);
+            total_scanned_bytes = file_size;
             let mut exfat_names_found = std::collections::HashSet::new();
 
             // 1. Prioritize ExFAT Directory Parsing to recover exact filenames & folder structure
@@ -554,6 +566,7 @@ pub fn execute_recovery_scan(
                         category: cat.to_string(),
                         folder_path: "Arborescence ExFAT / DCIM/100MEDIA".to_string(),
                         source_path: Some(target_path.to_string()),
+                        byte_offset: None,
                         size_bytes: ef.size_bytes,
                         lba_offset: lba,
                         cluster_count: clusters,
@@ -575,83 +588,106 @@ pub fn execute_recovery_scan(
             }
             let _ = f.seek(SeekFrom::Start(0));
 
-            let mut buf = vec![0u8; 1024 * 1024]; // 1MB scan window
-            let mut offset = 0u64;
-            let mut carved_idx = 1;
-
-            while offset < file_size.min(1024 * 1024 * 512) {
-                let n = match f.read(&mut buf) {
-                    Ok(bytes) if bytes > 0 => bytes,
-                    _ => break,
-                };
-                let slice = &buf[..n];
-
-                for i in 0..n.saturating_sub(32) {
-                    // QuickTime / MP4 signature: 'ftyp'
-                    if &slice[i + 4..i + 8] == b"ftyp" {
-                        let lba = (offset + i as u64) / 512;
-                        let item_size = 250 * 1024 * 1024;
-                        items.push(RecoverableFileItem {
-                            id: Uuid::new_v4().to_string(),
-                            name: format!("CARVED_VIDEO_{:04}.mov", carved_idx),
-                            extension: "mov".to_string(),
-                            category: "video".to_string(),
-                            folder_path: "Carving Brut / Signatures ISO-BMFF".to_string(),
-                            source_path: Some(target_path.to_string()),
-                            size_bytes: item_size,
-                            lba_offset: lba,
-                            cluster_count: (item_size + 4095) / 4096,
-                            fragment_count: 1,
-                            entropy_score: 7.85,
-                            integrity: "reconstructed".to_string(),
-                            recovery_probability: 98,
-                            is_deleted: true,
-                            modified_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
-                            codec_or_format_info: "Signature ftyp QuickTime / ProRes détectée".to_string(),
-                            header_hex_preview: format_hex_preview(&slice[i..i + 32], 32),
-                            needs_surgical_repair: true,
-                            health_badge: "needs_repair".to_string(),
-                            is_proxy_or_thumb: false,
-                        });
-                        total_recoverable_bytes += item_size;
-                        carved_idx += 1;
+            const MAX_CARVE_SCAN: u64 = 512 * 1024 * 1024;
+            let scan_limit = file_size.min(MAX_CARVE_SCAN) as usize;
+            let mut img_buf = vec![0u8; scan_limit];
+            if f.read_exact(&mut img_buf).is_ok() && img_buf.len() >= 12 {
+                let mut carved_idx = 1usize;
+                let mut i = 0usize;
+                while i + 12 <= img_buf.len() {
+                    // QuickTime / MP4 signature: plausible atom size + 'ftyp'
+                    if &img_buf[i + 4..i + 8] == b"ftyp" {
+                        let atom_sz = u32::from_be_bytes([
+                            img_buf[i],
+                            img_buf[i + 1],
+                            img_buf[i + 2],
+                            img_buf[i + 3],
+                        ]) as usize;
+                        if (16..=4096).contains(&atom_sz) && i + atom_sz <= img_buf.len() {
+                            let container_size = measure_isobmff_container_size(&img_buf, i, file_size)
+                                .min(file_size.saturating_sub(i as u64));
+                            let abs_offset = i as u64;
+                            let lba = abs_offset / 512;
+                            let head_end = (i + 32).min(img_buf.len());
+                            items.push(RecoverableFileItem {
+                                id: Uuid::new_v4().to_string(),
+                                name: format!("CARVED_VIDEO_{:04}.mov", carved_idx),
+                                extension: "mov".to_string(),
+                                category: "video".to_string(),
+                                folder_path: "Carving Brut / Signatures ISO-BMFF".to_string(),
+                                source_path: Some(target_path.to_string()),
+                                byte_offset: Some(abs_offset),
+                                size_bytes: container_size,
+                                lba_offset: lba,
+                                cluster_count: (container_size + 4095) / 4096,
+                                fragment_count: 1,
+                                entropy_score: analyze_block_entropy(&img_buf[i..head_end]).entropy_bits,
+                                integrity: "reconstructed".to_string(),
+                                recovery_probability: 98,
+                                is_deleted: true,
+                                modified_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
+                                codec_or_format_info: "Signature ftyp QuickTime / MP4 détectée".to_string(),
+                                header_hex_preview: format_hex_preview(&img_buf[i..head_end], 32),
+                                needs_surgical_repair: true,
+                                health_badge: "needs_repair".to_string(),
+                                is_proxy_or_thumb: false,
+                            });
+                            total_recoverable_bytes += container_size;
+                            carved_idx += 1;
+                            i += (container_size as usize).max(atom_sz);
+                            continue;
+                        }
                     }
-                    // JPEG signature: FF D8 FF
-                    else if slice[i] == 0xFF && slice[i + 1] == 0xD8 && slice[i + 2] == 0xFF {
-                        let lba = (offset + i as u64) / 512;
-                        let item_size = 15 * 1024 * 1024;
-                        items.push(RecoverableFileItem {
-                            id: Uuid::new_v4().to_string(),
-                            name: format!("CARVED_PHOTO_{:04}.jpg", carved_idx),
-                            extension: "jpg".to_string(),
-                            category: "photo_raster".to_string(),
-                            folder_path: "Carving Brut / Signatures JPEG".to_string(),
-                            source_path: Some(target_path.to_string()),
-                            size_bytes: item_size,
-                            lba_offset: lba,
-                            cluster_count: (item_size + 4095) / 4096,
-                            fragment_count: 1,
-                            entropy_score: 7.62,
-                            integrity: "intact".to_string(),
-                            recovery_probability: 100,
-                            is_deleted: true,
-                            modified_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
-                            codec_or_format_info: "En-tête JPEG JFIF/Exif valide".to_string(),
-                            header_hex_preview: format_hex_preview(&slice[i..i + 32], 32),
-                            needs_surgical_repair: false,
-                            health_badge: "intact".to_string(),
-                            is_proxy_or_thumb: false,
-                        });
-                        total_recoverable_bytes += item_size;
-                        carved_idx += 1;
+                    // JPEG signature: FF D8 FF followed by valid marker (E0..FF)
+                    else if img_buf[i] == 0xFF
+                        && img_buf[i + 1] == 0xD8
+                        && img_buf[i + 2] == 0xFF
+                        && img_buf[i + 3] >= 0xC0
+                    {
+                        let jpg_size = find_jpeg_eoi_size(&img_buf[i..], 32 * 1024 * 1024);
+                        if jpg_size >= 64 {
+                            let abs_offset = i as u64;
+                            let lba = abs_offset / 512;
+                            let head_end = (i + 32).min(img_buf.len());
+                            items.push(RecoverableFileItem {
+                                id: Uuid::new_v4().to_string(),
+                                name: format!("CARVED_PHOTO_{:04}.jpg", carved_idx),
+                                extension: "jpg".to_string(),
+                                category: "photo_raster".to_string(),
+                                folder_path: "Carving Brut / Signatures JPEG".to_string(),
+                                source_path: Some(target_path.to_string()),
+                                byte_offset: Some(abs_offset),
+                                size_bytes: jpg_size,
+                                lba_offset: lba,
+                                cluster_count: (jpg_size + 4095) / 4096,
+                                fragment_count: 1,
+                                entropy_score: analyze_block_entropy(&img_buf[i..head_end]).entropy_bits,
+                                integrity: "intact".to_string(),
+                                recovery_probability: 100,
+                                is_deleted: true,
+                                modified_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
+                                codec_or_format_info: "En-tête JPEG JFIF/Exif valide".to_string(),
+                                header_hex_preview: format_hex_preview(&img_buf[i..head_end], 32),
+                                needs_surgical_repair: false,
+                                health_badge: "intact".to_string(),
+                                is_proxy_or_thumb: false,
+                            });
+                            total_recoverable_bytes += jpg_size;
+                            carved_idx += 1;
+                            i += jpg_size as usize;
+                            continue;
+                        }
                     }
+                    i += 1;
                 }
-                offset += n as u64;
             }
         }
     }
 
-    let sector_map = vec![1u8; 180];
+    let elapsed_secs = scan_start.elapsed().as_secs_f64().max(0.001);
+    let measured_scanned = total_scanned_bytes.max(total_recoverable_bytes);
+    let speed_bps = ((measured_scanned as f64) / elapsed_secs) as u64;
+    let sector_map = vec![1u8; items.len().min(180)];
 
     Ok(RecoveryScanJob {
         id: Uuid::new_v4().to_string(),
@@ -659,19 +695,68 @@ pub fn execute_recovery_scan(
         device_path: target_path.to_string(),
         scan_mode: scan_mode.to_string(),
         status: "completed".to_string(),
-        phase_label: "Analyse Forensique & Défragmentation terminées".to_string(),
-        scanned_bytes: total_recoverable_bytes.max(1024 * 1024 * 512),
-        total_bytes: total_recoverable_bytes.max(1024 * 1024 * 512),
-        speed_bps: 845 * 1024 * 1024, // 845 MB/s
+        phase_label: "Analyse & Inventaire terminés".to_string(),
+        scanned_bytes: measured_scanned,
+        total_bytes: measured_scanned,
+        speed_bps,
         eta_seconds: Some(0),
         bad_sectors_count: 0,
-        partitions_found: 2,
+        partitions_found: 1,
         files_found_count: items.len(),
         total_recoverable_bytes,
         sector_map_sample: sector_map,
         items,
         started_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     })
+}
+
+fn find_jpeg_eoi_size(slice: &[u8], max_cap: usize) -> u64 {
+    let limit = slice.len().min(max_cap);
+    let mut pos = 2usize;
+    while pos + 1 < limit {
+        if slice[pos] == 0xFF && slice[pos + 1] == 0xD9 {
+            return (pos + 2) as u64;
+        }
+        pos += 1;
+    }
+    limit as u64
+}
+
+fn measure_isobmff_container_size(img: &[u8], start: usize, total_file_len: u64) -> u64 {
+    let mut pos = start;
+    while pos + 8 <= img.len() {
+        let size32 = u32::from_be_bytes([img[pos], img[pos + 1], img[pos + 2], img[pos + 3]]) as u64;
+        let fourcc = &img[pos + 4..pos + 8];
+        let known_atom = matches!(
+            fourcc,
+            b"ftyp" | b"wide" | b"mdat" | b"moov" | b"free" | b"skip" | b"uuid" | b"meta" | b"udta" | b"mvhd"
+        );
+        if !known_atom {
+            break;
+        }
+        let atom_len = if size32 == 1 && pos + 16 <= img.len() {
+            u64::from_be_bytes([
+                img[pos + 8],
+                img[pos + 9],
+                img[pos + 10],
+                img[pos + 11],
+                img[pos + 12],
+                img[pos + 13],
+                img[pos + 14],
+                img[pos + 15],
+            ])
+        } else {
+            size32
+        };
+        if atom_len < 8 || (pos as u64) + atom_len > total_file_len {
+            break;
+        }
+        pos += atom_len as usize;
+        if pos >= img.len() {
+            break;
+        }
+    }
+    (pos - start).max(16) as u64
 }
 
 /// Exports and reconstructs the selected recoverable files to a safe destination folder.
@@ -686,18 +771,24 @@ pub fn recover_selected_items(
         return Err("Aucun fichier sélectionné pour la récupération.".to_string());
     }
 
-    // Safety check: prevent overwriting the source volume if it's an external card/drive
-    if source_device_path != "/"
-        && !source_device_path.is_empty()
-        && destination_dir.starts_with(source_device_path)
-    {
-        return Err(
-            "Verrouillage Forensique : Impossible d'enregistrer les fichiers récupérés sur le support source lui-même (risque d'écrasement des clusters orphelins). Choisissez un autre disque ou dossier."
-                .to_string(),
-        );
+    let dest_root_p = PathBuf::from(destination_dir);
+    fs::create_dir_all(&dest_root_p)
+        .map_err(|e| format!("Impossible d'accéder au dossier de destination : {}", e))?;
+
+    // Canonical safety check: prevent overwriting the source volume
+    if source_device_path != "/" && !source_device_path.is_empty() {
+        let src_canon =
+            fs::canonicalize(source_device_path).unwrap_or_else(|_| PathBuf::from(source_device_path));
+        let dst_canon = fs::canonicalize(&dest_root_p).unwrap_or_else(|_| dest_root_p.clone());
+        if dst_canon.starts_with(&src_canon) {
+            return Err(
+                "Verrouillage Forensique : Impossible d'enregistrer les fichiers récupérés sur le support source lui-même (risque d'écrasement). Choisissez un autre disque ou dossier."
+                    .to_string(),
+            );
+        }
     }
 
-    let recovery_root = PathBuf::from(destination_dir).join(format!(
+    let recovery_root = dest_root_p.join(format!(
         "HardRecover_Export_{}",
         Local::now().format("%Y%m%d_%H%M%S")
     ));
@@ -709,85 +800,98 @@ pub fn recover_selected_items(
     let mut auto_repaired_count = 0usize;
 
     for item in &items {
-        let sub_dir = recovery_root.join(item.category.to_uppercase());
-        fs::create_dir_all(&sub_dir).map_err(|e| e.to_string())?;
-        let dest_file_path = sub_dir.join(&item.name);
+        let safe_fname = Path::new(&item.name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+            .ok_or_else(|| format!("Nom de fichier invalide ignoré : {}", item.name))?;
 
-        if let Some(ref src_str) = item.source_path {
-            let src_p = Path::new(src_str);
-            if src_p.exists() && src_p.is_file() {
-                if auto_repair_damaged && item.needs_surgical_repair {
-                    if let Ok(diag) = inspect_and_diagnose_media(src_str) {
-                        if let Ok(repaired) =
-                            repair_media_file(&diag, None, &sub_dir.to_string_lossy())
-                        {
-                            if let Some(rep_p) = repaired.repaired_output_path {
-                                if let Ok(m) = fs::metadata(rep_p) {
-                                    total_bytes_written += m.len();
-                                }
-                                auto_repaired_count += 1;
-                                recovered_count += 1;
-                                continue;
+        let safe_cat: String = item
+            .category
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let sub_dir = recovery_root.join(if safe_cat.is_empty() {
+            "OTHER".to_string()
+        } else {
+            safe_cat.to_uppercase()
+        });
+        fs::create_dir_all(&sub_dir).map_err(|e| e.to_string())?;
+        let dest_file_path = sub_dir.join(safe_fname);
+
+        let src_str = item.source_path.as_deref().ok_or_else(|| {
+            "Les éléments du Laboratoire Démo sont des aperçus pédagogiques sans fichier source physique."
+                .to_string()
+        })?;
+
+        let src_p = Path::new(src_str);
+        if !src_p.exists() || !src_p.is_file() {
+            return Err(format!("Fichier source introuvable ou inaccessible : {}", src_str));
+        }
+
+        if let Some(byte_off) = item.byte_offset {
+            // Exact byte-range extraction from raw disk image
+            let mut src_f = File::open(src_p).map_err(|e| e.to_string())?;
+            src_f.seek(SeekFrom::Start(byte_off)).map_err(|e| e.to_string())?;
+            let mut out_f = File::create(&dest_file_path).map_err(|e| e.to_string())?;
+            let mut remaining = item.size_bytes;
+            let mut buf = vec![0u8; 262_144];
+            let mut written_here = 0u64;
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(buf.len());
+                let n = src_f.read(&mut buf[..to_read]).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                out_f.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                remaining -= n as u64;
+                written_here += n as u64;
+            }
+            out_f.sync_all().map_err(|e| e.to_string())?;
+
+            if auto_repair_damaged && item.needs_surgical_repair {
+                let ext_path_str = dest_file_path.to_string_lossy().to_string();
+                if let Ok(diag) = inspect_and_diagnose_media(&ext_path_str) {
+                    if let Ok(repaired) =
+                        repair_media_file(&diag, None, &sub_dir.to_string_lossy())
+                    {
+                        if let Some(rep_p) = repaired.repaired_output_path {
+                            if let Ok(m) = fs::metadata(&rep_p) {
+                                total_bytes_written += m.len();
+                            } else {
+                                total_bytes_written += written_here;
                             }
+                            auto_repaired_count += 1;
+                            recovered_count += 1;
+                            continue;
                         }
                     }
                 }
-                if fs::copy(src_p, &dest_file_path).is_ok() {
-                    total_bytes_written += item.size_bytes;
-                    recovered_count += 1;
-                    continue;
+            }
+
+            total_bytes_written += written_here;
+            recovered_count += 1;
+        } else {
+            if auto_repair_damaged && item.needs_surgical_repair {
+                if let Ok(diag) = inspect_and_diagnose_media(src_str) {
+                    if let Ok(repaired) =
+                        repair_media_file(&diag, None, &sub_dir.to_string_lossy())
+                    {
+                        if let Some(rep_p) = repaired.repaired_output_path {
+                            if let Ok(m) = fs::metadata(rep_p) {
+                                total_bytes_written += m.len();
+                            }
+                            auto_repaired_count += 1;
+                            recovered_count += 1;
+                            continue;
+                        }
+                    }
                 }
             }
+            let copied = fs::copy(src_p, &dest_file_path).map_err(|e| e.to_string())?;
+            total_bytes_written += copied;
+            recovered_count += 1;
         }
-
-        // Reconstruct carved virtual stream into a valid container file on disk
-        let mut f = File::create(&dest_file_path).map_err(|e| e.to_string())?;
-        if item.extension == "mov" || item.extension == "mp4" || item.extension == "braw" {
-            let ftyp: [u8; 32] = [
-                0, 0, 0, 32, b'f', b't', b'y', b'p', b'q', b't', b' ', b' ', 0x20, 0x05, 0x03,
-                0x00, b'q', b't', b' ', b' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ];
-            let payload_size = 65536u32;
-            let mdat_size = 8 + payload_size;
-            f.write_all(&ftyp).map_err(|e| e.to_string())?;
-            f.write_all(&mdat_size.to_be_bytes()).map_err(|e| e.to_string())?;
-            f.write_all(b"mdat").map_err(|e| e.to_string())?;
-            f.write_all(&vec![0x42u8; payload_size as usize])
-                .map_err(|e| e.to_string())?;
-            total_bytes_written += (32 + mdat_size) as u64;
-            if item.needs_surgical_repair && auto_repair_damaged {
-                auto_repaired_count += 1;
-            }
-        } else if item.extension == "wav" {
-            let data_len = 32000u32;
-            let riff_len = 36 + data_len;
-            let mut hdr = Vec::with_capacity(44);
-            hdr.extend_from_slice(b"RIFF");
-            hdr.extend_from_slice(&riff_len.to_le_bytes());
-            hdr.extend_from_slice(b"WAVEfmt ");
-            hdr.extend_from_slice(&16u32.to_le_bytes());
-            hdr.extend_from_slice(&1u16.to_le_bytes());
-            hdr.extend_from_slice(&2u16.to_le_bytes());
-            hdr.extend_from_slice(&48000u32.to_le_bytes());
-            hdr.extend_from_slice(&(48000u32 * 4).to_le_bytes());
-            hdr.extend_from_slice(&4u16.to_le_bytes());
-            hdr.extend_from_slice(&16u16.to_le_bytes());
-            hdr.extend_from_slice(b"data");
-            hdr.extend_from_slice(&data_len.to_le_bytes());
-            f.write_all(&hdr).map_err(|e| e.to_string())?;
-            f.write_all(&vec![0u8; data_len as usize])
-                .map_err(|e| e.to_string())?;
-            total_bytes_written += (44 + data_len) as u64;
-            if item.needs_surgical_repair && auto_repair_damaged {
-                auto_repaired_count += 1;
-            }
-        } else {
-            let mut raw_buf = vec![0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
-            raw_buf.extend_from_slice(&vec![0x80u8; 16384]);
-            f.write_all(&raw_buf).map_err(|e| e.to_string())?;
-            total_bytes_written += raw_buf.len() as u64;
-        }
-        recovered_count += 1;
     }
 
     // Write Forensic Recovery Manifest JSON/TXT Report

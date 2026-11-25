@@ -87,6 +87,7 @@ pub fn open_in_file_manager(raw_path: &str) -> Result<(), String> {
                 #[cfg(target_os = "macos")]
                 {
                     Command::new("open")
+                        .arg("--")
                         .arg(parent)
                         .spawn()
                         .map_err(|e| format!("Impossible d'ouvrir le Finder : {}", e))?;
@@ -101,11 +102,12 @@ pub fn open_in_file_manager(raw_path: &str) -> Result<(), String> {
     {
         if p.is_file() {
             Command::new("open")
-                .args(["-R", raw_path])
+                .args(["-R", "--", raw_path])
                 .spawn()
                 .map_err(|e| format!("Impossible d'ouvrir le Finder : {}", e))?;
         } else {
             Command::new("open")
+                .arg("--")
                 .arg(p)
                 .spawn()
                 .map_err(|e| format!("Impossible d'ouvrir le Finder : {}", e))?;

@@ -32,6 +32,7 @@ export interface RecoverableFileItem {
   category: FileCategory;
   folderPath: string; // e.g. "DCIM/100MSDCF" or "Carved/MOV_ProRes"
   sourcePath: string | null; // if accessible on disk or carved virtual offset
+  byteOffset?: number;
   sizeBytes: number;
   lbaOffset: number;
   clusterCount: number;

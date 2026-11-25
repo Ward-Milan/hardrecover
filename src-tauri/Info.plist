@@ -8,6 +8,14 @@
     <false/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>HardRecover restaure vos fichiers récupérés vers votre dossier Bureau.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>HardRecover analyse et restaure vos fichiers dans votre dossier Documents.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>HardRecover analyse et restaure vos fichiers dans votre dossier Téléchargements.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>HardRecover analyse vos cartes SD, clés USB et disques externes pour récupérer les fichiers supprimés.</string>
 </dict>
 </plist>
 

@@ -2055,33 +2055,41 @@ pub fn repair_media_file(
     } else {
         // Photo RAW / JPEG repair or embedded preview extraction
         let raw_data = fs::read(src_path).map_err(|e| e.to_string())?;
-        let soi_pos = raw_data.windows(3).position(|w| w == [0xFF, 0xD8, 0xFF]);
+        let Some(pos) = raw_data.windows(3).position(|w| w == [0xFF, 0xD8, 0xFF]) else {
+            return Err(
+                "Aucun flux JPEG récupérable (marqueur SOI FF D8 FF) détecté dans ce fichier : les données d'image sont absentes ou entièrement corrompues."
+                    .to_string(),
+            );
+        };
 
         let out_file_name = format!("{}_REPAIRED.jpg", stem);
         let out_path = out_folder.join(out_file_name);
         let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
 
-        // If there is an embedded valid JPEG (SOI FF D8 FF), extract it and ensure EOI (FF D9)
-        if let Some(pos) = soi_pos {
-            let mut extracted = raw_data[pos..].to_vec();
-            if !extracted.ends_with(&[0xFF, 0xD9]) {
-                extracted.extend_from_slice(&[0xFF, 0xD9]);
-            }
-            out_file.write_all(&extracted).map_err(|e| e.to_string())?;
-            logs.push(format!(
-                "Flux JPEG haute définition extrait à l'offset 0x{:X} ({} octets) et finalisé avec succès.",
-                pos,
-                extracted.len()
-            ));
+        // Extract embedded JPEG stream (up to EOI FF D9 if present, otherwise append EOI)
+        let slice = &raw_data[pos..];
+        let mut extracted = if let Some(eoi_rel) = slice.windows(2).position(|w| w == [0xFF, 0xD9]) {
+            slice[..eoi_rel + 2].to_vec()
         } else {
-            // Synthesize valid JPEG preview from authentic baseline
-            out_file.write_all(VALID_DEMO_JPEG).map_err(|e| e.to_string())?;
-            logs.push("En-tête JPEG SOI/JFIF et flux d'image reconstruits avec succès.".to_string());
+            let mut v = slice.to_vec();
+            v.extend_from_slice(&[0xFF, 0xD9]);
+            v
+        };
+        if extracted.len() < 32 {
+            let _ = fs::remove_file(&out_path);
+            return Err("Flux JPEG détecté trop court pour contenir une image valide.".to_string());
         }
+        out_file.write_all(&extracted).map_err(|e| e.to_string())?;
+        logs.push(format!(
+            "Flux JPEG haute définition extrait à l'offset 0x{:X} ({} octets) et finalisé avec succès.",
+            pos,
+            extracted.len()
+        ));
+        extracted.clear();
 
         updated.health_status = "repaired".to_string();
         updated.corruption_severity = "none".to_string();
-        updated.anomaly_summary = "Réparé — Image extraite et marqueurs JPEG/TIFF restaurés".to_string();
+        updated.anomaly_summary = "Réparé — Flux JPEG extrait et marqueurs restaurés".to_string();
         updated.repaired_output_path = Some(out_path.to_string_lossy().to_string());
         updated.repair_log = logs;
     }

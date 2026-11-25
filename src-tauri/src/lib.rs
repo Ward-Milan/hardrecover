@@ -12,13 +12,10 @@ use carver::{
 };
 use chrono::Local;
 use imager_health::{
-    check_admin_privileges, create_forensic_disk_image, generate_certified_forensic_report,
-    mount_disk_image_readonly, quarantine_damaged_blocks,
-    regenerate_fatigued_nand_blocks as regenerate_nand_engine, request_admin_privileges,
-    revoke_admin_privileges, run_surface_and_health_diagnostic,
+    create_forensic_disk_image, generate_certified_forensic_report,
+    mount_disk_image_readonly, run_surface_and_health_diagnostic,
     run_targeted_micro_scan as run_micro_scan_engine, unmount_disk_image, DiskImageJobState,
-    ForensicCertificateRequest, MicroScanResult, MountedImageInfo, NandRegenerationResult,
-    QuarantineResult, SurfaceHealthReport,
+    ForensicCertificateRequest, MicroScanResult, MountedImageInfo, SurfaceHealthReport,
 };
 use media_repair::{
     generate_demo_corrupted_lab, inspect_and_diagnose_media, inspect_reference_file,
@@ -210,54 +207,6 @@ async fn run_drive_surface_check(
 }
 
 #[tauri::command]
-async fn isolate_bad_blocks(
-    mount_point: String,
-    device_name: String,
-    total_bytes: u64,
-    bad_sectors_count: u32,
-    method: String,
-    device_type: Option<String>,
-) -> Result<QuarantineResult, String> {
-    let dev_name = device_name.clone();
-    let mp = mount_point.clone();
-    let dt_clone = device_type.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        quarantine_damaged_blocks(
-            &mount_point,
-            &device_name,
-            total_bytes,
-            bad_sectors_count,
-            &method,
-            dt_clone.as_deref(),
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    let is_hdd = device_type.as_deref() == Some("hdd");
-    let target_label = if is_hdd {
-        format!("Quarantaine LBA ({})", dev_name)
-    } else {
-        format!("Quarantaine NAND ({})", dev_name)
-    };
-
-    append_session(SavedSessionEntry {
-        id: Uuid::new_v4().to_string(),
-        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        session_type: "recovery".to_string(),
-        target_name: target_label,
-        target_path: mp,
-        files_processed: res.isolated_clusters_count as usize,
-        total_bytes: res.usable_bytes,
-        status_label: res.summary.clone(),
-        destination_path: None,
-        report_path: None,
-    });
-
-    Ok(res)
-}
-
-#[tauri::command]
 async fn run_targeted_micro_scan(
     mount_point: String,
     device_name: String,
@@ -276,48 +225,6 @@ async fn run_targeted_micro_scan(
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn regenerate_nand_cells(
-    mount_point: String,
-    device_name: String,
-    total_bytes: u64,
-    slow_cells_count: u32,
-    device_type: Option<String>,
-) -> Result<NandRegenerationResult, String> {
-    let dev_name = device_name.clone();
-    let mp = mount_point.clone();
-    let dt_clone = device_type.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        regenerate_nand_engine(&mount_point, &device_name, total_bytes, slow_cells_count, dt_clone.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    if res.regenerated_blocks_count > 0 {
-        let is_hdd = device_type.as_deref() == Some("hdd");
-        let target_label = if is_hdd {
-            format!("Remagnétisation ({})", dev_name)
-        } else {
-            format!("Régénération NAND ({})", dev_name)
-        };
-
-        append_session(SavedSessionEntry {
-            id: Uuid::new_v4().to_string(),
-            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            session_type: "repair".to_string(),
-            target_name: target_label,
-            target_path: mp,
-            files_processed: res.regenerated_blocks_count as usize,
-            total_bytes: res.regenerated_bytes,
-            status_label: res.summary.clone(),
-            destination_path: None,
-            report_path: None,
-        });
-    }
-
-    Ok(res)
 }
 
 #[tauri::command]
@@ -355,25 +262,6 @@ async fn unmount_rescue_image(target: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn check_admin_status() -> bool {
-    check_admin_privileges()
-}
-
-#[tauri::command]
-async fn request_admin_elevation() -> Result<bool, String> {
-    tokio::task::spawn_blocking(request_admin_privileges)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn revoke_admin_elevation() -> Result<bool, String> {
-    tokio::task::spawn_blocking(revoke_admin_privileges)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
 async fn generate_forensic_certificate(request: ForensicCertificateRequest) -> Result<String, String> {
     tokio::task::spawn_blocking(move || generate_certified_forensic_report(&request))
         .await
@@ -398,13 +286,8 @@ pub fn run() {
             start_forensic_disk_image,
             run_drive_surface_check,
             run_targeted_micro_scan,
-            regenerate_nand_cells,
-            isolate_bad_blocks,
             mount_rescue_image,
             unmount_rescue_image,
-            check_admin_status,
-            request_admin_elevation,
-            revoke_admin_elevation,
             generate_forensic_certificate,
             get_app_settings,
             update_app_settings,
@@ -479,10 +362,21 @@ mod tests {
             repair_media_file(&items[1], None, &out_dir).expect("wav repair failed");
         assert_eq!(repaired_wav.health_status, "repaired");
 
-        // Repair the damaged ARW RAW photo
+        // Repair the damaged ARW RAW photo (contains real embedded JPEG)
         let repaired_raw =
             repair_media_file(&items[2], None, &out_dir).expect("raw repair failed");
         assert_eq!(repaired_raw.health_status, "repaired");
+
+        // Ensure an unrecoverable photo with no JPEG SOI marker fails honestly (never writes demo image)
+        let bogus_photo = std::path::Path::new(&out_dir).join("UNRECOVERABLE_ZEROED.jpg");
+        std::fs::write(&bogus_photo, vec![0x00u8; 4096]).expect("write bogus photo");
+        let bogus_item =
+            inspect_and_diagnose_media(&bogus_photo.to_string_lossy()).expect("inspect bogus");
+        assert!(repair_media_file(&bogus_item, None, &out_dir).is_err());
+        assert!(!std::path::Path::new(&out_dir)
+            .join("UNRECOVERABLE_ZEROED_REPAIRED.jpg")
+            .exists());
+        let _ = std::fs::remove_file(&bogus_photo);
     }
 
     #[test]
@@ -499,81 +393,96 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_block_quarantine_rehabilitation() {
-        use crate::imager_health::quarantine_damaged_blocks;
-        let total = 64 * 1024 * 1024 * 1024u64; // 64 GB SD card
+    fn test_real_forensic_disk_image_and_carving() {
+        use crate::carver::{execute_recovery_scan, recover_selected_items};
+        use crate::imager_health::create_forensic_disk_image;
 
-        // Healthy drive with 0 bad sectors
-        let healthy = quarantine_damaged_blocks("/tmp", "Lexar 1800x SDXC", total, 0, "bitmap", Some("sd_card"))
-            .expect("healthy quarantine check failed");
-        assert_eq!(healthy.quarantined_bytes, 0);
-        assert_eq!(healthy.usable_bytes, total);
+        let tmp_dir =
+            std::env::temp_dir().join(format!("hardrecover_real_{}", uuid::Uuid::new_v4()));
+        let src_dir = tmp_dir.join("src");
+        let img_out_dir = tmp_dir.join("img_out");
+        let rec_out_dir = tmp_dir.join("rec_out");
+        std::fs::create_dir_all(&src_dir).unwrap();
 
-        // Damaged drive with 2 bad sectors
-        let res = quarantine_damaged_blocks("/tmp", "Lexar 1800x SDXC", total, 2, "bitmap", Some("sd_card"))
-            .expect("quarantine failed");
-        assert_eq!(res.original_bytes, total);
-        assert!(res.quarantined_bytes > 0);
-        assert!(res.usable_bytes < total);
-        assert!(res.isolated_clusters_count > 0);
-        assert!(!res.steps_performed.is_empty());
+        // Build a raw file containing a real JPEG payload surrounded by padding
+        let raw_path = src_dir.join("card_dump.raw");
+        let mut raw_bytes = vec![0x00u8; 4096];
+        let mut real_jpeg = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        real_jpeg.extend(vec![0x7Au8; 512]);
+        real_jpeg.extend([0xFFu8, 0xD9]);
+        raw_bytes.extend_from_slice(&real_jpeg);
+        raw_bytes.extend(vec![0x00u8; 4096]);
+        std::fs::write(&raw_path, &raw_bytes).unwrap();
 
-        // Damaged HDD with 2 bad sectors
-        let hdd_res = quarantine_damaged_blocks("/tmp", "WD Blue HDD", total, 2, "bitmap", Some("hdd"))
-            .expect("hdd quarantine failed");
-        assert!(hdd_res.summary.contains("Disque"));
+        // 1. Real raw disk imaging
+        let img_job = create_forensic_disk_image(
+            &raw_path.to_string_lossy(),
+            "CardDump",
+            &img_out_dir.to_string_lossy(),
+            64,
+            32768,
+        )
+        .expect("real disk image failed");
+        assert_eq!(img_job.total_bytes, raw_bytes.len() as u64);
+        assert_eq!(
+            std::fs::read(&img_job.output_image_path).unwrap(),
+            raw_bytes
+        );
+
+        // 2. Carve the created image and verify exact JPEG size & byte recovery
+        let scan_job = execute_recovery_scan(&img_job.output_image_path, "CardDump", "quick_and_deep")
+            .expect("scan on real image failed");
+        let jpg_item = scan_job
+            .items
+            .iter()
+            .find(|i| i.extension == "jpg")
+            .expect("JPEG signature should be carved");
+        assert_eq!(jpg_item.size_bytes, real_jpeg.len() as u64);
+        assert_eq!(jpg_item.byte_offset, Some(4096));
+
+        let export = recover_selected_items(
+            &img_job.output_image_path,
+            vec![jpg_item.clone()],
+            &rec_out_dir.to_string_lossy(),
+            false,
+        )
+        .expect("export from real image failed");
+        assert_eq!(export.recovered_count, 1);
+
+        let exported_jpg = std::path::Path::new(&export.destination_folder)
+            .join("PHOTO_RASTER")
+            .join(&jpg_item.name);
+        assert_eq!(std::fs::read(&exported_jpg).unwrap(), real_jpeg);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
-    fn test_targeted_micro_scan() {
-        use crate::imager_health::run_targeted_micro_scan;
-        let total = 64 * 1024 * 1024 * 1024u64; // 64 GB
-        let micro = run_targeted_micro_scan("/tmp", "Sony Tough G 64GB", total, 48, 240)
-            .expect("micro scan failed");
-        assert_eq!(micro.probe_index, 48);
-        assert!(micro.slice_bytes > 0);
-        assert_eq!(micro.tested_pages_count, 128);
-    }
+    fn test_demo_items_cannot_fake_export_and_readonly_policy() {
+        use crate::carver::{execute_recovery_scan, recover_selected_items};
+        use crate::imager_health::{quarantine_damaged_blocks, regenerate_fatigued_nand_blocks};
 
-    #[test]
-    fn test_regenerate_fatigued_nand_blocks() {
-        use crate::imager_health::regenerate_fatigued_nand_blocks;
-        let total = 64 * 1024 * 1024 * 1024u64;
+        let demo_scan = execute_recovery_scan("demo", "Demo", "demo").expect("demo scan ok");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("hardrecover_demo_{}", uuid::Uuid::new_v4()));
+        assert!(recover_selected_items("demo", vec![demo_scan.items[0].clone()], &tmp_dir.to_string_lossy(), false).is_err());
 
-        // Healthy card with 0 slow cells
-        let healthy = regenerate_fatigued_nand_blocks("/tmp", "SanDisk Extreme", total, 0, Some("sd_card"))
-            .expect("healthy regen test failed");
-        assert_eq!(healthy.regenerated_blocks_count, 0);
-
-        // Fatigued card with 2 slow cells
-        let regen = regenerate_fatigued_nand_blocks("/tmp", "SanDisk Extreme", total, 2, Some("sd_card"))
-            .expect("regen test failed");
-        assert_eq!(regen.regenerated_blocks_count, 2);
-        assert!(regen.speedup_factor > 10.0);
-        assert!(regen.avg_latency_after_us < regen.avg_latency_before_us);
-
-        // Fatigued HDD with 2 slow LBA sectors
-        let hdd_regen = regenerate_fatigued_nand_blocks("/tmp", "Seagate Expansion HDD", total, 2, Some("hdd"))
-            .expect("hdd regen test failed");
-        assert_eq!(hdd_regen.regenerated_blocks_count, 2);
-        assert!(hdd_regen.summary.contains("secteur(s) magnétique(s)"));
+        assert!(quarantine_damaged_blocks("/tmp", "Test", 1024, 1, "bitmap", None).is_err());
+        assert!(regenerate_fatigued_nand_blocks("/tmp", "Test", 1024, 1, None).is_err());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_exfat_directory_entry_parser() {
         use crate::carver::scan_exfat_directory_entries;
 
-        // Build a synthetic 3-entry ExFAT record (96 bytes):
-        // Entry 1: 0x85 File Directory Entry
         let mut block = vec![0u8; 96];
         block[0] = 0x85;
-        block[1] = 2; // secondary_count (1 stream + 1 name entry)
-        // Entry 2: 0xC0 Stream Extension Entry (starts at byte 32)
+        block[1] = 2;
         block[32] = 0xC0;
-        block[32 + 3] = 0x08; // NameLength = 8 chars ("CLIP.MOV")
-        block[32 + 20..32 + 24].copy_from_slice(&100u32.to_le_bytes()); // first_cluster = 100
-        block[32 + 24..32 + 32].copy_from_slice(&1048576u64.to_le_bytes()); // valid_data_length = 1MB
-        // Entry 3: 0xC1 File Name Entry (starts at byte 64)
+        block[32 + 3] = 0x08;
+        block[32 + 20..32 + 24].copy_from_slice(&100u32.to_le_bytes());
+        block[32 + 24..32 + 32].copy_from_slice(&1048576u64.to_le_bytes());
         block[64] = 0xC1;
         let test_name = "CLIP.MOV";
         for (i, c) in test_name.encode_utf16().enumerate() {
@@ -590,23 +499,23 @@ mod tests {
     }
 
     #[test]
-    fn test_forensic_certificate_generation() {
+    fn test_forensic_certificate_xss_escaping_and_honesty() {
         use crate::imager_health::{generate_certified_forensic_report, ForensicCertificateRequest};
         use std::path::Path;
 
         let req = ForensicCertificateRequest {
-            device_name: "Sony Tough SF-G 128GB".to_string(),
+            device_name: "SD_<script>alert(1)</script>".to_string(),
             bsd_name: "disk5s1".to_string(),
             file_system: "ExFAT".to_string(),
             total_bytes: 128 * 1024 * 1024 * 1024,
-            serial_number: Some("SN-TOUGH-2026-99A".to_string()),
+            serial_number: None,
             vendor: Some("Sony Corporation".to_string()),
-            smart_status: "Verified (Intègre)".to_string(),
+            smart_status: "Verified".to_string(),
             health_score: 98,
             bad_sectors_count: 0,
             quarantined_clusters: 0,
             image_path: None,
-            output_dir: "/tmp".to_string(),
+            output_dir: std::env::temp_dir().to_string_lossy().to_string(),
             device_type: Some("sd_card".to_string()),
         };
 
@@ -614,11 +523,21 @@ mod tests {
             .expect("forensic certificate generation failed");
         assert!(Path::new(&report_path).exists());
         let content = std::fs::read_to_string(&report_path).expect("reading report failed");
-        assert!(content.contains("HARD SUITE — FORENSIC DATA RECOVERY LAB"));
-        assert!(content.contains("Sony Tough SF-G 128GB"));
-        assert!(content.contains("SN-TOUGH-2026-99A"));
-        assert!(content.contains("SHA-256"));
+        assert!(!content.contains("<script>alert(1)</script>"));
+        assert!(content.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!content.contains("SN-4829-AF91-0392"));
+        assert!(content.contains("Non communiqué par le contrôleur"));
         let _ = std::fs::remove_file(&report_path);
+    }
+
+    #[test]
+    fn test_hardrecover_updater_url_validation() {
+        assert!(updater::validate_update_url(
+            "https://github.com/Ward-Milan/hardrecover/releases/download/v1.0.1/HardRecover_1.0.1_aarch64.dmg"
+        )
+        .is_ok());
+        assert!(updater::validate_update_url("https://evil.com/HardRecover.dmg").is_err());
+        assert!(updater::validate_update_url("-o /tmp/x").is_err());
     }
 }
 

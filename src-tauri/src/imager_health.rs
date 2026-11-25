@@ -1,11 +1,14 @@
 use crate::math_engine::{analyze_block_entropy, compute_exponential_skip_sectors};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use uuid::Uuid;
+use walkdir::WalkDir;
+use xxhash_rust::xxh3::Xxh3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,7 +18,7 @@ pub struct DiskImageJobState {
     pub source_path: String,
     pub output_image_path: String,
     pub map_file_path: String,
-    pub status: String, // "phase1_sweep" | "phase2_trim" | "phase3_scrape" | "phase4_retry" | "completed"
+    pub status: String,
     pub phase_label: String,
     pub processed_bytes: u64,
     pub total_bytes: u64,
@@ -25,7 +28,7 @@ pub struct DiskImageJobState {
     pub slow_blocks: u32,
     pub bad_sectors: u32,
     pub current_skip_step_sectors: u64,
-    pub sector_grid: Vec<u8>, // 240 cells: 0=pending, 1=healthy, 2=slow_nand, 3=bad_sector, 4=skipped_jump
+    pub sector_grid: Vec<u8>, // 1=healthy, 2=slow, 3=bad/error
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +48,7 @@ pub struct SurfaceHealthReport {
     pub real_capacity_bytes: u64,
     pub counterfeit_note: String,
     pub entropy_distribution: String,
-    pub tested_blocks_grid: Vec<u8>, // 240 cells: 1=fast (<1ms), 2=normal (1-5ms), 3=weak_nand (5-50ms), 4=critical (>50ms)
+    pub tested_blocks_grid: Vec<u8>, // 1=fast (<1ms), 2=normal (1-10ms), 3=slow (10-50ms), 4=critical (>=50ms or I/O error)
     pub auto_micro_scans: Vec<MicroScanResult>,
 }
 
@@ -81,294 +84,6 @@ pub struct NandRegenerationResult {
     pub details: Vec<String>,
 }
 
-/// Applies macOS `F_NOCACHE` on a file descriptor to bypass the unified RAM buffer cache
-/// during forensic surface inspection and imaging.
-#[cfg(target_os = "macos")]
-fn set_fd_nocache(file: &File) {
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        let _ = libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_fd_nocache(_file: &File) {}
-
-/// Tool 1: Creates a Forensic Rescue Disk Image (`.img` + `.hrmap`) using the 5-Pass Adaptive Bad-Sector Algorithm.
-pub fn create_forensic_disk_image(
-    source_path: &str,
-    source_name: &str,
-    output_dir: &str,
-    s0_sectors: u64,
-    s_max_sectors: u64,
-) -> Result<DiskImageJobState, String> {
-    if source_path != "/" && output_dir.starts_with(source_path) {
-        return Err(
-            "Verrouillage Forensique : Impossible d'écrire l'image disque sur le support source lui-même."
-                .to_string(),
-        );
-    }
-
-    let out_folder = PathBuf::from(output_dir);
-    fs::create_dir_all(&out_folder).map_err(|e| e.to_string())?;
-
-    let safe_name = source_name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect::<String>();
-    let stamp = Local::now().format("%Y%m%d_%H%M%S");
-    let img_path = out_folder.join(format!("Rescue_{}_{}.img", safe_name, stamp));
-    let map_path = out_folder.join(format!("Rescue_{}_{}.hrmap.json", safe_name, stamp));
-
-    let start_instant = Instant::now();
-    let mut img_file = File::create(&img_path).map_err(|e| e.to_string())?;
-    set_fd_nocache(&img_file);
-
-    // Sample physical data from source if it's a file or readable directory, and build the 240-block LBA map
-    let mut sector_grid = Vec::with_capacity(240);
-    let mut healthy_blocks = 0u32;
-    let mut slow_blocks = 0u32;
-    let mut bad_sectors = 0u32;
-    let mut consecutive_errors = 0u32;
-    let mut max_skip_seen = s0_sectors;
-
-    let block_buf = vec![0x5Au8; 16384];
-    for idx in 0..240 {
-        img_file.write_all(&block_buf).map_err(|e| e.to_string())?;
-        if idx == 78 || idx == 79 {
-            // Simulate encountering a localized NAND bad sector cluster handled by Phase 1->4
-            bad_sectors += 1;
-            consecutive_errors += 1;
-            let skip = compute_exponential_skip_sectors(consecutive_errors, s0_sectors, s_max_sectors);
-            if skip > max_skip_seen {
-                max_skip_seen = skip;
-            }
-            sector_grid.push(3);
-        } else if idx == 80 {
-            // Exponential jump transition cell trimmed during Phase 2
-            slow_blocks += 1;
-            consecutive_errors = 0;
-            sector_grid.push(2);
-        } else if idx % 53 == 0 && idx > 0 {
-            slow_blocks += 1;
-            sector_grid.push(2);
-        } else {
-            healthy_blocks += 1;
-            sector_grid.push(1);
-        }
-    }
-    img_file.flush().map_err(|e| e.to_string())?;
-
-    let total_written = (240 * block_buf.len()) as u64;
-    let elapsed_secs = start_instant.elapsed().as_secs_f64().max(0.002);
-    let speed = ((total_written as f64) / elapsed_secs) as u64;
-
-    let job_state = DiskImageJobState {
-        id: Uuid::new_v4().to_string(),
-        source_device_name: source_name.to_string(),
-        source_path: source_path.to_string(),
-        output_image_path: img_path.to_string_lossy().to_string(),
-        map_file_path: map_path.to_string_lossy().to_string(),
-        status: "completed".to_string(),
-        phase_label: "5 Passes complétées (Sweep → Trim → Scrape → Retry → Map)".to_string(),
-        processed_bytes: total_written,
-        total_bytes: total_written,
-        speed_bps: speed.max(520 * 1024 * 1024),
-        eta_seconds: Some(0),
-        healthy_blocks,
-        slow_blocks,
-        bad_sectors,
-        current_skip_step_sectors: max_skip_seen,
-        sector_grid,
-    };
-
-    // Write the persistent `.hrmap.json` forensic block map
-    if let Ok(json_str) = serde_json::to_string_pretty(&job_state) {
-        let _ = fs::write(&map_path, json_str);
-    }
-
-    Ok(job_state)
-}
-
-/// Tool 7: Profiles real physical read latency (`F_NOCACHE`), S.M.A.R.T. health, and checks for counterfeit capacity wrap-around.
-fn get_regenerated_devices_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".hardrecover").join("regenerated_devices.json")
-}
-
-pub fn is_device_regenerated(device_name: &str) -> bool {
-    let p = get_regenerated_devices_path();
-    if let Ok(content) = fs::read_to_string(&p) {
-        if let Ok(list) = serde_json::from_str::<Vec<String>>(&content) {
-            return list.contains(&device_name.to_string());
-        }
-    }
-    false
-}
-
-pub fn mark_device_regenerated(device_name: &str) {
-    let p = get_regenerated_devices_path();
-    let mut list = if let Ok(content) = fs::read_to_string(&p) {
-        serde_json::from_str::<Vec<String>>(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    if !list.contains(&device_name.to_string()) {
-        list.push(device_name.to_string());
-        if let Ok(json) = serde_json::to_string(&list) {
-            if let Some(parent) = p.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::write(&p, json);
-        }
-    }
-}
-
-pub fn run_surface_and_health_diagnostic(
-    mount_point: &str,
-    device_name: &str,
-    total_bytes: u64,
-    device_type: Option<&str>,
-) -> Result<SurfaceHealthReport, String> {
-    let mut latencies_us: Vec<u64> = Vec::with_capacity(240);
-    let mut grid: Vec<u8> = Vec::with_capacity(240);
-    let mut slow_cells = 0u32;
-    let mut critical_cells = 0u32;
-    let mut entropy_acc = 0.0f64;
-    let mut entropy_samples = 0usize;
-
-    // Perform fast uncached microsecond read probes on up to 4 small files within the volume
-    let root = Path::new(mount_point);
-    if root.exists() && root.is_dir() {
-        if let Ok(entries) = fs::read_dir(root) {
-            for entry in entries.filter_map(|e| e.ok()).take(4) {
-                let p = entry.path();
-                if p.is_file() {
-                    if let Ok(mut f) = File::open(&p) {
-                        set_fd_nocache(&f);
-                        let mut buf = [0u8; 4096];
-                        let t0 = Instant::now();
-                        if let Ok(n) = f.read(&mut buf) {
-                            let us = t0.elapsed().as_micros() as u64;
-                            latencies_us.push(us.max(45));
-                            if n > 0 {
-                                let ent = analyze_block_entropy(&buf[..n]);
-                                entropy_acc += ent.entropy_bits;
-                                entropy_samples += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let is_internal_drive = mount_point == "/"
-        || device_name.contains("Macintosh HD")
-        || device_name.to_lowercase().contains("internal")
-        || device_name.to_lowercase().contains("apple");
-
-    let is_already_regenerated = is_device_regenerated(device_name)
-        || root.join(".hardrecover_regenerated.marker").exists();
-
-    while latencies_us.len() < 240 {
-        let idx = latencies_us.len();
-        let synth_us = if is_internal_drive || is_already_regenerated {
-            // Internal Apple NVMe or freshly regenerated NAND: ultra-fast 60µs to 320µs (< 1 ms)
-            60 + ((idx * 17) % 240) as u64
-        } else if idx % 67 == 0 && idx > 0 {
-            // Wear detected on non-regenerated external flash media before refresh
-            6400
-        } else {
-            140 + ((idx * 37) % 420) as u64
-        };
-        latencies_us.push(synth_us);
-    }
-
-    for &us in &latencies_us {
-        if us < 1000 {
-            grid.push(1); // Fast (< 1ms)
-        } else if us < 5000 {
-            grid.push(2); // Normal (1 - 5ms)
-        } else if us < 50000 {
-            slow_cells += 1;
-            grid.push(3); // Weak NAND cell (LDPC retry)
-        } else {
-            critical_cells += 1;
-            grid.push(4); // Critical latency (> 50ms ou erreur I/O)
-        }
-    }
-
-    let mut sorted = latencies_us.clone();
-    sorted.sort_unstable();
-    let avg_us = sorted.iter().sum::<u64>() / (sorted.len() as u64);
-    let p99_us = sorted[(sorted.len() * 99) / 100];
-    let max_us = *sorted.last().unwrap_or(&avg_us);
-
-    let avg_entropy = if entropy_samples > 0 {
-        entropy_acc / (entropy_samples as f64)
-    } else {
-        7.42
-    };
-
-    // Phase 2: Automatic Targeted Micro-Scan if any slices show fatigue (yellow) or critical latency (red)
-    let mut auto_micro_scans = Vec::new();
-    let mut pinpointed_bad_count = critical_cells;
-
-    for (idx, &val) in grid.iter().enumerate() {
-        if val == 3 || val == 4 {
-            if let Ok(micro) = run_targeted_micro_scan(mount_point, device_name, total_bytes, idx, 240) {
-                if micro.bad_blocks_count > 0 {
-                    pinpointed_bad_count = pinpointed_bad_count.max(micro.bad_blocks_count);
-                }
-                auto_micro_scans.push(micro);
-                if auto_micro_scans.len() >= 2 {
-                    break;
-                }
-            }
-        }
-    }
-
-    let is_hdd = device_type == Some("hdd");
-    let smart_status = if auto_micro_scans.is_empty() {
-        if is_hdd {
-            "Vérifié — Mécanique, Têtes & Table LBA Intègres (100% Sain)".to_string()
-        } else {
-            "Vérifié — Contrôleur Flash & Table LBA Intègres (100% Sain)".to_string()
-        }
-    } else {
-        format!(
-            "Anomalie détectée sur {} zone(s) : Micro-Scan chirurgical exécuté automatiquement.",
-            auto_micro_scans.len()
-        )
-    };
-
-    let counterfeit_note = if is_hdd {
-        "Disque Magnétique Authentique — Aucun bouclage LBA, servomarques et géométrie des plateaux conformes.".to_string()
-    } else {
-        "Authentique — Aucun bouclage d'adresse LBA modulo 2^k détecté sur les secteurs hauts.".to_string()
-    };
-
-    Ok(SurfaceHealthReport {
-        device_name: device_name.to_string(),
-        mount_point: mount_point.to_string(),
-        total_bytes,
-        smart_status,
-        nand_wear_percent: if is_hdd { 1 } else { 3 },
-        avg_latency_us: avg_us,
-        p99_latency_us: p99_us,
-        max_latency_us: max_us,
-        slow_cells_count: slow_cells,
-        bad_sectors_count: pinpointed_bad_count,
-        is_counterfeit_capacity: false,
-        real_capacity_bytes: total_bytes,
-        counterfeit_note,
-        entropy_distribution: format!("{:.2} bits/octet (Médias sains)", avg_entropy),
-        tested_blocks_grid: grid,
-        auto_micro_scans,
-    })
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuarantineResult {
@@ -382,144 +97,593 @@ pub struct QuarantineResult {
     pub steps_performed: Vec<String>,
 }
 
-/// Isolates defective NAND cells / bad sectors by:
-/// 1. Creating a persistent low-level quarantine allocation mask (`.hardrecover_quarantine.bin`)
-///    which locks physical clusters associated with bad LBAs so the filesystem, camera, and macOS never write to them again.
-/// 2. Computing the new safe geometry (quarantined exclusion zone) so 99.8% to 99.9% of the storage remains 100% operational and safe.
-pub fn quarantine_damaged_blocks(
+#[cfg(target_os = "macos")]
+fn set_fd_nocache(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        let _ = libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_fd_nocache(_file: &File) {}
+
+fn is_ignored_volume_entry(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains("/.Spotlight-V100")
+        || s.contains("/.fseventsd")
+        || s.contains("/.TemporaryItems")
+        || s.contains("/.DocumentRevisions-V100")
+        || s.contains("/.Trashes")
+}
+
+fn downsample_outcomes_to_grid(outcomes: &[u8], target_cells: usize) -> Vec<u8> {
+    if outcomes.is_empty() {
+        return Vec::new();
+    }
+    if outcomes.len() <= target_cells {
+        return outcomes.to_vec();
+    }
+    let mut grid = Vec::with_capacity(target_cells);
+    for cell_idx in 0..target_cells {
+        let start = (cell_idx * outcomes.len()) / target_cells;
+        let end = (((cell_idx + 1) * outcomes.len()) / target_cells).max(start + 1);
+        let worst = outcomes[start..end.min(outcomes.len())]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1);
+        grid.push(worst);
+    }
+    grid
+}
+
+/// Creates a real read-only rescue disk image (raw `.img` for raw files/devices, read-only `.dmg` via `hdiutil` for mounted volumes)
+/// plus a `.hrmap.json` progress/sector map. Never writes to the source volume.
+pub fn create_forensic_disk_image(
+    source_path: &str,
+    source_name: &str,
+    output_dir: &str,
+    s0_sectors: u64,
+    s_max_sectors: u64,
+) -> Result<DiskImageJobState, String> {
+    if source_path == "/" {
+        return Err(
+            "Verrouillage Forensique : Impossible de créer une image disque brute depuis le volume système racine actif."
+                .to_string(),
+        );
+    }
+
+    let source_p = Path::new(source_path);
+    if !source_p.exists() {
+        return Err(format!("Source introuvable : {}", source_path));
+    }
+
+    let out_folder = PathBuf::from(output_dir);
+    fs::create_dir_all(&out_folder).map_err(|e| e.to_string())?;
+
+    let src_canon = fs::canonicalize(source_p).unwrap_or_else(|_| source_p.to_path_buf());
+    let out_canon = fs::canonicalize(&out_folder).unwrap_or_else(|_| out_folder.clone());
+    if out_canon.starts_with(&src_canon) {
+        return Err(
+            "Verrouillage Forensique : Impossible d'enregistrer l'image disque sur le support source lui-même."
+                .to_string(),
+        );
+    }
+
+    let safe_name = source_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let stamp = Local::now().format("%Y%m%d_%H%M%S");
+    let map_path = out_canon.join(format!("Rescue_{}_{}.hrmap.json", safe_name, stamp));
+
+    let start_instant = Instant::now();
+
+    if source_p.is_file() || source_path.starts_with("/dev/") {
+        let img_path = out_canon.join(format!("Rescue_{}_{}.img", safe_name, stamp));
+        let mut src_file = File::open(source_p)
+            .map_err(|e| format!("Impossible d'ouvrir la source en lecture seule : {}", e))?;
+        set_fd_nocache(&src_file);
+
+        let src_len = src_file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut img_file = File::create(&img_path).map_err(|e| e.to_string())?;
+        set_fd_nocache(&img_file);
+
+        const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut outcomes: Vec<u8> = Vec::new();
+        let mut healthy_blocks = 0u32;
+        let mut slow_blocks = 0u32;
+        let mut bad_sectors = 0u32;
+        let mut consecutive_errors = 0u32;
+        let mut max_skip_seen = s0_sectors;
+        let mut total_written = 0u64;
+        let mut offset = 0u64;
+
+        loop {
+            let chunk_start = Instant::now();
+            match src_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    img_file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                    total_written = total_written.saturating_add(n as u64);
+                    offset = offset.saturating_add(n as u64);
+                    consecutive_errors = 0;
+
+                    if chunk_start.elapsed().as_millis() > 50 {
+                        slow_blocks += 1;
+                        outcomes.push(2);
+                    } else {
+                        healthy_blocks += 1;
+                        outcomes.push(1);
+                    }
+                }
+                Err(_) => {
+                    bad_sectors += 1;
+                    consecutive_errors += 1;
+                    let skip_sectors = compute_exponential_skip_sectors(
+                        consecutive_errors,
+                        s0_sectors,
+                        s_max_sectors,
+                    );
+                    if skip_sectors > max_skip_seen {
+                        max_skip_seen = skip_sectors;
+                    }
+                    let step_bytes = (skip_sectors * 512).clamp(4096, CHUNK_SIZE as u64) as usize;
+                    let write_len = if src_len > 0 {
+                        step_bytes.min(src_len.saturating_sub(offset) as usize)
+                    } else {
+                        step_bytes
+                    };
+                    if write_len == 0 {
+                        break;
+                    }
+                    let zeros = vec![0u8; write_len];
+                    img_file.write_all(&zeros).map_err(|e| e.to_string())?;
+                    total_written = total_written.saturating_add(write_len as u64);
+                    offset = offset.saturating_add(write_len as u64);
+                    if src_file.seek(SeekFrom::Start(offset)).is_err() {
+                        break;
+                    }
+                    outcomes.push(3);
+                }
+            }
+        }
+
+        img_file.sync_all().map_err(|e| e.to_string())?;
+        let elapsed_secs = start_instant.elapsed().as_secs_f64().max(0.001);
+        let speed = ((total_written as f64) / elapsed_secs) as u64;
+        let sector_grid = downsample_outcomes_to_grid(&outcomes, 240);
+
+        let job_state = DiskImageJobState {
+            id: Uuid::new_v4().to_string(),
+            source_device_name: source_name.to_string(),
+            source_path: source_path.to_string(),
+            output_image_path: img_path.to_string_lossy().to_string(),
+            map_file_path: map_path.to_string_lossy().to_string(),
+            status: "completed".to_string(),
+            phase_label: if bad_sectors == 0 {
+                "Clonage binaire direct terminé (0 erreur de lecture)".to_string()
+            } else {
+                format!(
+                    "Clonage adaptatif terminé ({} zone(s) illisible(s) contournée(s))",
+                    bad_sectors
+                )
+            },
+            processed_bytes: total_written,
+            total_bytes: total_written,
+            speed_bps: speed,
+            eta_seconds: Some(0),
+            healthy_blocks,
+            slow_blocks,
+            bad_sectors,
+            current_skip_step_sectors: max_skip_seen,
+            sector_grid,
+        };
+
+        if let Ok(json_str) = serde_json::to_string_pretty(&job_state) {
+            let _ = fs::write(&map_path, json_str);
+        }
+        return Ok(job_state);
+    }
+
+    // Directory / mounted volume: build a real read-only macOS disk image via `hdiutil create`
+    #[cfg(target_os = "macos")]
+    {
+        let dmg_path = out_canon.join(format!("Rescue_{}_{}.dmg", safe_name, stamp));
+        let dmg_str = dmg_path
+            .to_str()
+            .ok_or_else(|| "Chemin de destination invalide.".to_string())?;
+
+        let output = std::process::Command::new("/usr/bin/hdiutil")
+            .args([
+                "create",
+                "-srcfolder",
+                source_path,
+                "-format",
+                "UDRO",
+                "-ov",
+                dmg_str,
+            ])
+            .output()
+            .map_err(|e| format!("Échec d'exécution de hdiutil : {}", e))?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("Échec de création de l'image disque : {}", err));
+        }
+
+        let dmg_meta = fs::metadata(&dmg_path).map_err(|e| e.to_string())?;
+        let total_written = dmg_meta.len();
+        let elapsed_secs = start_instant.elapsed().as_secs_f64().max(0.001);
+        let speed = ((total_written as f64) / elapsed_secs) as u64;
+
+        // Sample up to 240 evenly-spaced reads across the created image to verify readability
+        let mut outcomes = Vec::new();
+        let mut healthy_blocks = 0u32;
+        let mut slow_blocks = 0u32;
+        let mut bad_sectors = 0u32;
+
+        if let Ok(mut f) = File::open(&dmg_path) {
+            set_fd_nocache(&f);
+            let sample_count = 240usize.min(((total_written / 4096).max(1)) as usize);
+            let mut probe = [0u8; 4096];
+            for idx in 0..sample_count {
+                let off = if sample_count > 1 && total_written > 4096 {
+                    ((idx as u64) * (total_written - 4096)) / ((sample_count - 1) as u64)
+                } else {
+                    0
+                };
+                let t0 = Instant::now();
+                if f.seek(SeekFrom::Start(off)).is_ok() && f.read(&mut probe).is_ok() {
+                    if t0.elapsed().as_millis() > 20 {
+                        slow_blocks += 1;
+                        outcomes.push(2);
+                    } else {
+                        healthy_blocks += 1;
+                        outcomes.push(1);
+                    }
+                } else {
+                    bad_sectors += 1;
+                    outcomes.push(3);
+                }
+            }
+        }
+
+        let job_state = DiskImageJobState {
+            id: Uuid::new_v4().to_string(),
+            source_device_name: source_name.to_string(),
+            source_path: source_path.to_string(),
+            output_image_path: dmg_path.to_string_lossy().to_string(),
+            map_file_path: map_path.to_string_lossy().to_string(),
+            status: "completed".to_string(),
+            phase_label: "Image disque lecture seule générée et vérifiée".to_string(),
+            processed_bytes: total_written,
+            total_bytes: total_written,
+            speed_bps: speed,
+            eta_seconds: Some(0),
+            healthy_blocks,
+            slow_blocks,
+            bad_sectors,
+            current_skip_step_sectors: s0_sectors,
+            sector_grid: outcomes,
+        };
+
+        if let Ok(json_str) = serde_json::to_string_pretty(&job_state) {
+            let _ = fs::write(&map_path, json_str);
+        }
+
+        Ok(job_state)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (s_max_sectors, stamp, map_path);
+        Err("La création d'image à partir d'un volume monté nécessite macOS hdiutil.".to_string())
+    }
+}
+
+fn query_real_smart_status(mount_point: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("/usr/sbin/diskutil")
+            .args(["info", mount_point])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Some((k, v)) = trimmed.split_once(':') {
+                    if k.trim() == "SMART Status" {
+                        return v.trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = mount_point;
+
+    "Non exposé".to_string()
+}
+
+/// Strictly read-only diagnostic probing real files across the volume with `F_NOCACHE`.
+/// Never fabricates synthetic latencies and never writes onto the inspected storage.
+pub fn run_surface_and_health_diagnostic(
     mount_point: &str,
     device_name: &str,
     total_bytes: u64,
-    bad_sectors_count: u32,
-    method: &str,
-    device_type: Option<&str>,
-) -> Result<QuarantineResult, String> {
-    let is_hdd = device_type == Some("hdd");
-    let method_label = if method == "partition" || method == "shrink_partition" {
-        "Re-découpage des Frontières de Partition (GPT/MBR Boundary Relocation)"
-    } else if is_hdd {
-        "Verrouillage d'Allocation Magnétique (Bad-Block LBA Exclusion)"
-    } else {
-        "Verrouillage d'Allocation (Inoculation Bad-Block Bitmap ExFAT/FAT32)"
-    };
+    _device_type: Option<&str>,
+) -> Result<SurfaceHealthReport, String> {
+    let root = Path::new(mount_point);
+    if !root.exists() {
+        return Err(format!("Le point de montage '{}' est introuvable.", mount_point));
+    }
 
-    if bad_sectors_count == 0 {
-        return Ok(QuarantineResult {
+    let mut candidate_files: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in WalkDir::new(root)
+        .max_depth(5)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if candidate_files.len() >= 120 {
+            break;
+        }
+        let p = entry.path();
+        if is_ignored_volume_entry(p) {
+            continue;
+        }
+        if entry.file_type().is_file() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() > 0 {
+                    candidate_files.push((p.to_path_buf(), meta.len()));
+                }
+            }
+        }
+    }
+
+    let mut latencies_us: Vec<u64> = Vec::new();
+    let mut grid: Vec<u8> = Vec::new();
+    let mut slow_cells = 0u32;
+    let mut critical_cells = 0u32;
+    let mut entropy_acc = 0.0f64;
+    let mut entropy_samples = 0usize;
+    let mut slow_file_indices: Vec<(usize, PathBuf, u64)> = Vec::new();
+
+    if !candidate_files.is_empty() {
+        let target_probes = 240usize;
+        let probes_per_file = (target_probes / candidate_files.len()).clamp(1, 24);
+        let mut buf = [0u8; 65536];
+
+        'outer: for (file_path, file_len) in &candidate_files {
+            if let Ok(mut f) = File::open(file_path) {
+                set_fd_nocache(&f);
+                for slot in 0..probes_per_file {
+                    if latencies_us.len() >= target_probes {
+                        break 'outer;
+                    }
+                    let offset = if probes_per_file > 1 && *file_len > buf.len() as u64 {
+                        ((slot as u64) * (*file_len - buf.len() as u64))
+                            / ((probes_per_file - 1) as u64)
+                    } else {
+                        0
+                    };
+                    if f.seek(SeekFrom::Start(offset)).is_err() {
+                        critical_cells += 1;
+                        let probe_idx = latencies_us.len();
+                        latencies_us.push(100_000);
+                        grid.push(4);
+                        slow_file_indices.push((probe_idx, file_path.clone(), offset));
+                        continue;
+                    }
+                    let t0 = Instant::now();
+                    match f.read(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            let us = t0.elapsed().as_micros() as u64;
+                            let probe_idx = latencies_us.len();
+                            latencies_us.push(us);
+                            let ent = analyze_block_entropy(&buf[..n]);
+                            entropy_acc += ent.entropy_bits;
+                            entropy_samples += 1;
+
+                            if us < 1000 {
+                                grid.push(1);
+                            } else if us < 10_000 {
+                                grid.push(2);
+                            } else if us < 50_000 {
+                                slow_cells += 1;
+                                grid.push(3);
+                                slow_file_indices.push((probe_idx, file_path.clone(), offset));
+                            } else {
+                                critical_cells += 1;
+                                grid.push(4);
+                                slow_file_indices.push((probe_idx, file_path.clone(), offset));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            critical_cells += 1;
+                            let probe_idx = latencies_us.len();
+                            latencies_us.push(100_000);
+                            grid.push(4);
+                            slow_file_indices.push((probe_idx, file_path.clone(), offset));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let real_smart = query_real_smart_status(mount_point);
+    if latencies_us.is_empty() {
+        return Ok(SurfaceHealthReport {
             device_name: device_name.to_string(),
-            original_bytes: total_bytes,
-            quarantined_bytes: 0,
-            usable_bytes: total_bytes,
-            isolated_clusters_count: 0,
-            isolation_method: method_label.to_string(),
-            summary: if is_hdd {
-                format!(
-                    "Disque 100% sain ({}) : 0 secteur défectueux. Aucun secteur LBA neutralisé, surface magnétique parfaite.",
-                    device_name
-                )
-            } else {
-                format!(
-                    "Support 100% sain ({}) : 0 bloc NAND défectueux. Aucune cellule neutralisée, intégrité parfaite.",
-                    device_name
-                )
-            },
-            steps_performed: if is_hdd {
-                vec![
-                    "Scan LBA matériel : Temps de positionnement des têtes de lecture et rémanence validés.".to_string(),
-                    "Intégrité certifiée : 0 secteur critique ou instable (> 50 ms / EIO) détecté.".to_string(),
-                    format!(
-                        "Capacité totale saine : {:.2} Go 100% opérationnels et sécurisés.",
-                        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                    ),
-                    "Aucune neutralisation requise : les plateaux magnétiques répondent de manière nominale.".to_string(),
-                ]
-            } else {
-                vec![
-                    "Scan LBA matériel : Sonde de latence et temps d'accès mémoires validés.".to_string(),
-                    "Intégrité certifiée : 0 secteur critique ou mort (> 50 ms / EIO) détecté.".to_string(),
-                    format!(
-                        "Capacité totale saine : {:.2} Go 100% opérationnels et sécurisés.",
-                        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                    ),
-                    "Aucune neutralisation requise : aucune cellule saine n'a été retirée.".to_string(),
-                ]
-            },
+            mount_point: mount_point.to_string(),
+            total_bytes,
+            smart_status: format!(
+                "Volume vide ou aucun fichier lisible — S.M.A.R.T. : {}",
+                real_smart
+            ),
+            nand_wear_percent: 0,
+            avg_latency_us: 0,
+            p99_latency_us: 0,
+            max_latency_us: 0,
+            slow_cells_count: 0,
+            bad_sectors_count: 0,
+            is_counterfeit_capacity: false,
+            real_capacity_bytes: total_bytes,
+            counterfeit_note:
+                "Test de capacité non exécuté en mode lecture seule strict (utilisez HardHub pour un test d'écriture/vérification sur support vide)."
+                    .to_string(),
+            entropy_distribution: "Aucune donnée mesurée".to_string(),
+            tested_blocks_grid: Vec::new(),
+            auto_micro_scans: Vec::new(),
         });
     }
 
-    let bad_count = bad_sectors_count;
-    let block_size = if is_hdd { 4 * 1024 * 1024u64 } else { 16 * 1024 * 1024u64 };
-    let quarantined_bytes = (bad_count as u64) * block_size;
-    let usable_bytes = total_bytes.saturating_sub(quarantined_bytes);
+    let mut sorted = latencies_us.clone();
+    sorted.sort_unstable();
+    let avg_us = sorted.iter().sum::<u64>() / (sorted.len() as u64);
+    let p99_us = sorted[((sorted.len() * 99) / 100).min(sorted.len() - 1)];
+    let max_us = *sorted.last().unwrap_or(&avg_us);
 
-    let mut steps = Vec::new();
-    if is_hdd {
-        steps.push(format!(
-            "Scan matériel : {} secteur(s) magnétique(s) défaillants identifiés lors du test de surface des plateaux.",
-            bad_count
-        ));
+    let avg_entropy = if entropy_samples > 0 {
+        entropy_acc / (entropy_samples as f64)
     } else {
-        steps.push(format!(
-            "Scan matériel : {} bloc(s) de cellules NAND défaillants identifiés lors du test de surface.",
-            bad_count
-        ));
-    }
+        0.0
+    };
 
-    let root = Path::new(mount_point);
-    if root.exists() && root.is_dir() {
-        let quarantine_file_path = root.join(".hardrecover_badblock_quarantine.bin");
-        if let Ok(mut f) = File::create(&quarantine_file_path) {
-            let zero_buf = vec![0x00u8; 65536];
-            let _ = f.write_all(&zero_buf);
-            let _ = f.flush();
-            if is_hdd {
-                steps.push("Table d'allocation : Clusters magnétiques défectueux verrouillés hors de l'espace adressable pour prévenir les atterrissages de tête.".to_string());
-            } else {
-                steps.push("Table d'allocation : Fichier de réservation système créé pour verrouiller les clusters défectueux.".to_string());
-            }
+    let mut auto_micro_scans = Vec::new();
+    for (probe_idx, file_path, offset) in slow_file_indices.into_iter().take(2) {
+        if let Ok(micro) = probe_file_region_nocache(&file_path, offset, probe_idx, latencies_us.len()) {
+            auto_micro_scans.push(micro);
         }
-    } else {
-        steps.push("Simulation forensique : Calcul de la nouvelle géométrie de partition avec exclusion de la plage défectueuse.".to_string());
     }
 
-    steps.push(format!(
-        "Quarantaine appliquée : {} Mo isolés sur {} Go ({:.2}% de la capacité totale réhabilitée avec zéro risque d'erreur).",
-        quarantined_bytes / (1024 * 1024),
-        total_bytes / (1024 * 1024 * 1024),
-        (usable_bytes as f64 / total_bytes.max(1) as f64) * 100.0
-    ));
-    if is_hdd {
-        steps.push("Les têtes de lecture et le système d'exploitation n'adresseront plus jamais ces secteurs physiques dégradés.".to_string());
+    let smart_status = if critical_cells > 0 {
+        format!(
+            "{} erreur(s) ou latence(s) critique(s) (> 50 ms) sur {} sondes — S.M.A.R.T. : {}",
+            critical_cells,
+            latencies_us.len(),
+            real_smart
+        )
+    } else if slow_cells > 0 {
+        format!(
+            "{} zone(s) lente(s) (10-50 ms) sur {} sondes — S.M.A.R.T. : {}",
+            slow_cells,
+            latencies_us.len(),
+            real_smart
+        )
     } else {
-        steps.push("Le contrôleur et le système d'exploitation n'alloueront plus jamais cette zone mémoire dégradée.".to_string());
-    }
+        format!(
+            "Lecture saine ({} sondes physiques F_NOCACHE) — S.M.A.R.T. : {}",
+            latencies_us.len(),
+            real_smart
+        )
+    };
 
-    Ok(QuarantineResult {
+    Ok(SurfaceHealthReport {
         device_name: device_name.to_string(),
-        original_bytes: total_bytes,
-        quarantined_bytes,
-        usable_bytes,
-        isolated_clusters_count: bad_count * 4096,
-        isolation_method: method_label.to_string(),
-        summary: if is_hdd {
-            format!(
-                "Disque réhabilité avec succès : {} Mo isolés, {} Go 100% sains et exploitables.",
-                quarantined_bytes / (1024 * 1024),
-                usable_bytes / (1024 * 1024 * 1024)
-            )
-        } else {
-            format!(
-                "Support réhabilité avec succès : {} Mo isolés, {} Go 100% sains et exploitables.",
-                quarantined_bytes / (1024 * 1024),
-                usable_bytes / (1024 * 1024 * 1024)
-            )
-        },
-        steps_performed: steps,
+        mount_point: mount_point.to_string(),
+        total_bytes,
+        smart_status,
+        nand_wear_percent: 0,
+        avg_latency_us: avg_us,
+        p99_latency_us: p99_us,
+        max_latency_us: max_us,
+        slow_cells_count: slow_cells,
+        bad_sectors_count: critical_cells,
+        is_counterfeit_capacity: false,
+        real_capacity_bytes: total_bytes,
+        counterfeit_note:
+            "Test de capacité non exécuté en mode lecture seule strict (utilisez HardHub pour un test d'écriture/vérification sur support vide)."
+                .to_string(),
+        entropy_distribution: format!("{:.2} bits/octet", avg_entropy),
+        tested_blocks_grid: grid,
+        auto_micro_scans,
     })
 }
 
-/// Performs a surgical Micro-Scan specifically targeted on a suspicious ~250 MB slice
-/// identified by a probe index during the initial Macro-Scan.
-/// Pinpoints the exact LBA address and reduces the quarantine to the minimal 16 MB Erase Block.
+fn probe_file_region_nocache(
+    file_path: &Path,
+    base_offset: u64,
+    probe_index: usize,
+    _probes_count: usize,
+) -> Result<MicroScanResult, String> {
+    let mut f = File::open(file_path).map_err(|e| e.to_string())?;
+    set_fd_nocache(&f);
+    let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let end_offset = (base_offset + 512 * 1024).min(file_len);
+    let pages_to_test = 16usize;
+    let mut bad_lbas = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    for page_idx in 0..pages_to_test {
+        let off = base_offset + (page_idx as u64) * 32768;
+        if off >= file_len {
+            break;
+        }
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            bad_lbas.push(off / 512);
+            continue;
+        }
+        let t0 = Instant::now();
+        match f.read(&mut buf) {
+            Ok(_) => {
+                if t0.elapsed().as_micros() >= 50_000 {
+                    bad_lbas.push(off / 512);
+                }
+            }
+            Err(_) => {
+                bad_lbas.push(off / 512);
+            }
+        }
+    }
+
+    let bad_blocks_count = bad_lbas.len() as u32;
+    let fname = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("fichier");
+
+    let summary = if bad_blocks_count > 0 {
+        format!(
+            "Sonde ciblée sur {} : {} page(s) en erreur ou > 50 ms détectée(s). Créez immédiatement une image de sauvetage.",
+            fname, bad_blocks_count
+        )
+    } else {
+        format!(
+            "Sonde ciblée sur {} : lecture secondaire confirmée sans erreur I/O ({} pages 4K testées).",
+            fname, pages_to_test
+        )
+    };
+
+    Ok(MicroScanResult {
+        probe_index,
+        start_byte: base_offset,
+        end_byte: end_offset,
+        slice_bytes: end_offset.saturating_sub(base_offset),
+        start_lba: base_offset / 512,
+        end_lba: end_offset / 512,
+        tested_pages_count: pages_to_test,
+        bad_lbas,
+        bad_blocks_count,
+        quarantined_bytes: 0,
+        exact_dead_block_offset: base_offset,
+        summary,
+        is_pinpointed: bad_blocks_count > 0,
+    })
+}
+
+/// Read-only micro-scan helper targeting real files on the volume.
 pub fn run_targeted_micro_scan(
     mount_point: &str,
     _device_name: &str,
@@ -531,212 +695,58 @@ pub fn run_targeted_micro_scan(
     let slice_bytes = total_bytes / (count as u64);
     let start_byte = (probe_index as u64) * slice_bytes;
     let end_byte = ((probe_index as u64 + 1) * slice_bytes).min(total_bytes);
-    let slice_len = end_byte.saturating_sub(start_byte);
-
-    let start_lba = start_byte / 512;
-    let end_lba = end_byte / 512;
-
-    // Scan 128 micro-pages (4 KB pages) across this 250 MB slice
-    let tested_pages = 128usize;
-
-    let mut bad_lbas = Vec::new();
-    let mut exact_dead_offset = 0u64;
 
     let root = Path::new(mount_point);
     if root.exists() && root.is_dir() {
-        let mut sample_buf = [0u8; 4096];
-        if let Ok(entries) = fs::read_dir(root) {
-            for entry in entries.filter_map(|e| e.ok()).take(5) {
-                let p = entry.path();
-                if p.is_file() {
-                    if let Ok(mut f) = File::open(&p) {
-                        set_fd_nocache(&f);
-                        let t0 = Instant::now();
-                        let _ = f.read(&mut sample_buf);
-                        let us = t0.elapsed().as_micros();
-                        if us > 50000 {
-                            let lba = start_lba + 2048;
-                            bad_lbas.push(lba);
-                        }
-                    }
+        for entry in WalkDir::new(root).max_depth(3).into_iter().flatten() {
+            if entry.file_type().is_file() {
+                if let Ok(res) = probe_file_region_nocache(entry.path(), 0, probe_index, count) {
+                    return Ok(res);
                 }
             }
         }
     }
 
-    let is_pinpointed = !bad_lbas.is_empty();
-    let bad_blocks_count = if is_pinpointed { bad_lbas.len() as u32 } else { 0 };
-    // Minimal NAND erase block size is 16 MB instead of the full 250 MB slice!
-    let quarantined_bytes = if bad_blocks_count > 0 {
-        (bad_blocks_count as u64) * 16 * 1024 * 1024
-    } else {
-        0
-    };
-
-    if is_pinpointed {
-        exact_dead_offset = start_byte + (bad_lbas[0] - start_lba) * 512;
-    }
-
-    let summary = if is_pinpointed {
-        format!(
-            "Micro-Scan Ciblé Réussi : Cellule défaillante localisée avec précision au secteur LBA #{}. Périmètre de neutralisation réduit à {} Mo (au lieu de {} Mo pour la tranche entière).",
-            bad_lbas[0],
-            quarantined_bytes / (1024 * 1024),
-            slice_len / (1024 * 1024)
-        )
-    } else {
-        format!(
-            "Micro-Scan Ciblé Terminé sur la tranche #{} ({} Mo) : 128 pages LBA testées, 0 secteur mort. Intégrité de la zone confirmée.",
-            probe_index + 1,
-            slice_len / (1024 * 1024)
-        )
-    };
-
     Ok(MicroScanResult {
         probe_index,
         start_byte,
         end_byte,
-        slice_bytes: slice_len,
-        start_lba,
-        end_lba,
-        tested_pages_count: tested_pages,
-        bad_lbas,
-        bad_blocks_count,
-        quarantined_bytes,
-        exact_dead_block_offset: exact_dead_offset,
-        summary,
-        is_pinpointed,
+        slice_bytes: end_byte.saturating_sub(start_byte),
+        start_lba: start_byte / 512,
+        end_lba: end_byte / 512,
+        tested_pages_count: 0,
+        bad_lbas: Vec::new(),
+        bad_blocks_count: 0,
+        quarantined_bytes: 0,
+        exact_dead_block_offset: 0,
+        summary: "Aucun fichier lisible dans cette zone (mode lecture seule strict).".to_string(),
+        is_pinpointed: false,
     })
 }
 
-/// Regenerates fatigued media sectors / blocks (yellow latency: 5 to 50 ms):
-/// - On Flash (SD, SSD, NVMe): Read-Verify-Refresh charge cycles on weak NAND cells.
-/// - On HDD: Read-Verify-Refresh magnetic flux cycles, rewriting unstable LBA sectors on platters.
-/// Zero data loss, zero risk to hardware.
-pub fn regenerate_fatigued_nand_blocks(
-    mount_point: &str,
-    device_name: &str,
+/// HardRecover strictly operates read-only and refuses to write onto a failing drive.
+pub fn quarantine_damaged_blocks(
+    _mount_point: &str,
+    _device_name: &str,
     _total_bytes: u64,
-    slow_cells_count: u32,
-    device_type: Option<&str>,
+    _bad_sectors_count: u32,
+    _method: &str,
+    _device_type: Option<&str>,
+) -> Result<QuarantineResult, String> {
+    Err("Mode Lecture Seule Strict : HardRecover n'écrit jamais sur un support potentiellement défectueux. Sauvegardez une image disque puis reformatez ou remplacez le support."
+        .to_string())
+}
+
+/// HardRecover strictly operates read-only and refuses to write onto a failing drive.
+pub fn regenerate_fatigued_nand_blocks(
+    _mount_point: &str,
+    _device_name: &str,
+    _total_bytes: u64,
+    _slow_cells_count: u32,
+    _device_type: Option<&str>,
 ) -> Result<NandRegenerationResult, String> {
-    let is_hdd = device_type == Some("hdd");
-    if slow_cells_count == 0 {
-        return Ok(NandRegenerationResult {
-            device_name: device_name.to_string(),
-            mount_point: mount_point.to_string(),
-            regenerated_blocks_count: 0,
-            regenerated_bytes: 0,
-            avg_latency_before_us: 420,
-            avg_latency_after_us: 420,
-            speedup_factor: 1.0,
-            summary: if is_hdd {
-                format!(
-                    "Intégrité magnétique optimale ({}) : Aucun secteur LBA fatigué. Tous les plateaux conservent une rémanence parfaite.",
-                    device_name
-                )
-            } else {
-                format!(
-                    "Intégrité maximale ({}) : Aucune cellule fatiguée détectée. Toutes les cellules sont à leur plein potentiel électrique.",
-                    device_name
-                )
-            },
-            details: if is_hdd {
-                vec![
-                    "Vérification de flux : Aucun affaiblissement de rémanence magnétique détecté sur les pistes.".to_string(),
-                    "Temps de réponse mécanique : Temps d'accès et positionnement des têtes nominaux (< 1 ms).".to_string(),
-                    "Zéro réessai de lecture nécessaire sur l'ensemble des plateaux.".to_string(),
-                ]
-            } else {
-                vec![
-                    "Vérification de charge : Aucune dérive de potentiel électrique détectée.".to_string(),
-                    "Codes LDPC : Zéro réessai nécessaire sur l'ensemble de la carte.".to_string(),
-                    "Toutes les cellules conservent une tension nominale optimale (< 1 ms).".to_string(),
-                ]
-            },
-        });
-    }
-
-    let count = slow_cells_count;
-    let block_size = if is_hdd { 4 * 1024 * 1024u64 } else { 16 * 1024 * 1024u64 };
-    let regenerated_bytes = (count as u64) * block_size;
-
-    let latency_before_us = 18_400u64; // ~18.4 ms (slow LDPC or head retry)
-    let latency_after_us = 340u64;      // ~0.34 ms (instant response)
-    let speedup = (latency_before_us as f64) / (latency_after_us as f64);
-
-    let mut details = Vec::new();
-    if is_hdd {
-        details.push(format!(
-            "Sécurisation tampon : Lecture et mise en mémoire tampon RAM des {} secteur(s) magnétique(s) instables.",
-            count
-        ));
-        details.push("Contrôle d'intégrité : Checksum CRC32 calculé et validé sur les pistes magnétiques.".to_string());
-    } else {
-        details.push(format!(
-            "Sécurisation tampon : Lecture et mise en mémoire tampon RAM des {} bloc(s) fatigués.",
-            count
-        ));
-        details.push("Contrôle d'intégrité : Checksum CRC32 calculé et validé sur le payload.".to_string());
-    }
-
-    mark_device_regenerated(device_name);
-
-    let root = Path::new(mount_point);
-    if root.exists() && root.is_dir() {
-        // Atomic charge refresh marker (instantaneous, safe, zero risk to user data)
-        let marker_path = root.join(".hardrecover_regenerated.marker");
-        if let Ok(mut f) = File::create(&marker_path) {
-            let _ = f.write_all(b"REGENERATED_OK\n");
-            let _ = f.sync_all(); // Flushes hardware write buffer
-        }
-        if is_hdd {
-            details.push("Remagnétisation & Réalignement : Réécriture dynamique des secteurs instables avec purge du cache de disque.".to_string());
-            details.push("Vérification post-remagnétisation : Rémanence magnétique stabilisée et temps d'accès de tête sous 1 ms.".to_string());
-        } else {
-            details.push("Cycle d'effacement & Re-polarisation : Signal de synchronisation matérielle envoyé au contrôleur flash.".to_string());
-            details.push("Vérification post-recharge : Potentiel électrique des grilles flottantes restauré sous 1 ms.".to_string());
-        }
-    } else {
-        if is_hdd {
-            details.push("Simulation forensique : Cycle de remagnétisation et réalignement LBA simulé avec succès.".to_string());
-        } else {
-            details.push("Simulation forensique : Cycle de purge et re-polarisation simulé avec succès.".to_string());
-        }
-    }
-
-    details.push(format!(
-        "Gain de performance mesuré : Latence réduite de {:.1} ms à {:.2} ms (Accélération ×{:.0}).",
-        latency_before_us as f64 / 1000.0,
-        latency_after_us as f64 / 1000.0,
-        speedup
-    ));
-
-    Ok(NandRegenerationResult {
-        device_name: device_name.to_string(),
-        mount_point: mount_point.to_string(),
-        regenerated_blocks_count: count,
-        regenerated_bytes,
-        avg_latency_before_us: latency_before_us,
-        avg_latency_after_us: latency_after_us,
-        speedup_factor: speedup,
-        summary: if is_hdd {
-            format!(
-                "Régénération disque réussie : {} secteur(s) magnétique(s) rafraîchis ({} Mo réalignés, temps d'accès divisé par {:.0}).",
-                count,
-                regenerated_bytes / (1024 * 1024),
-                speedup
-            )
-        } else {
-            format!(
-                "Régénération réussie : {} bloc(s) de cellules NAND régénérés ({} Mo rafraîchis, latence divisée par {:.0}).",
-                count,
-                regenerated_bytes / (1024 * 1024),
-                speedup
-            )
-        },
-        details,
-    })
+    Err("Mode Lecture Seule Strict : HardRecover n'écrit jamais sur un support en cours de diagnostic. Sauvegardez vos données sur un autre disque."
+        .to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -748,8 +758,7 @@ pub struct MountedImageInfo {
     pub is_read_only: bool,
 }
 
-/// Mounts a forensic rescue image (.img or .dmg) as a strictly read-only volume in macOS
-/// so files can be safely browsed in the Finder without stressing the failing hardware.
+/// Mounts a rescue disk image (.img or .dmg) as a strictly read-only volume in macOS.
 pub fn mount_disk_image_readonly(image_path: &str) -> Result<MountedImageInfo, String> {
     let p = Path::new(image_path);
     if !p.exists() {
@@ -758,7 +767,7 @@ pub fn mount_disk_image_readonly(image_path: &str) -> Result<MountedImageInfo, S
 
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("hdiutil")
+        let output = std::process::Command::new("/usr/bin/hdiutil")
             .args(["attach", "-readonly", "-plist", image_path])
             .output()
             .map_err(|e| format!("Échec d'exécution de hdiutil : {}", e))?;
@@ -767,7 +776,10 @@ pub fn mount_disk_image_readonly(image_path: &str) -> Result<MountedImageInfo, S
         let stderr_str = String::from_utf8_lossy(&output.stderr);
 
         if !output.status.success() && !stdout_str.contains("<key>mount-point</key>") {
-            return Err(format!("Erreur lors du montage de l'image disque : {}", stderr_str.trim()));
+            return Err(format!(
+                "Erreur lors du montage de l'image disque : {}",
+                stderr_str.trim()
+            ));
         }
 
         let mut mount_point = String::new();
@@ -794,32 +806,26 @@ pub fn mount_disk_image_readonly(image_path: &str) -> Result<MountedImageInfo, S
         }
 
         if mount_point.is_empty() {
-            // Fallback: check if standard volume path exists
-            let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-            let candidate = format!("/Volumes/{}", stem);
-            if Path::new(&candidate).exists() {
-                mount_point = candidate;
-            } else {
-                mount_point = format!("/Volumes/Rescue_{}", stem);
-            }
+            return Err(
+                "Image attachée sans système de fichiers montable par macOS.".to_string(),
+            );
         }
 
         Ok(MountedImageInfo {
             image_path: image_path.to_string(),
             mount_point,
-            disk_identifier: if disk_id.is_empty() { "/dev/disk_rescue".to_string() } else { disk_id },
+            disk_identifier: if disk_id.is_empty() {
+                "indisponible".to_string()
+            } else {
+                disk_id
+            },
             is_read_only: true,
         })
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        Ok(MountedImageInfo {
-            image_path: image_path.to_string(),
-            mount_point: format!("/mnt/Rescue_{}", p.file_stem().unwrap_or_default().to_string_lossy()),
-            disk_identifier: "loop0".to_string(),
-            is_read_only: true,
-        })
+        Err("Montage hdiutil disponible uniquement sur macOS.".to_string())
     }
 }
 
@@ -827,15 +833,16 @@ pub fn mount_disk_image_readonly(image_path: &str) -> Result<MountedImageInfo, S
 pub fn unmount_disk_image(target_mount_or_disk: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("hdiutil")
+        let output = std::process::Command::new("/usr/bin/hdiutil")
             .args(["detach", target_mount_or_disk, "-force"])
             .output()
             .map_err(|e| format!("Échec du détachement hdiutil : {}", e))?;
 
         if !output.status.success() {
             let err_msg = String::from_utf8_lossy(&output.stderr);
-            // Ignore if already unmounted
-            if !err_msg.contains("No such file or directory") && !err_msg.contains("not currently mounted") {
+            if !err_msg.contains("No such file or directory")
+                && !err_msg.contains("not currently mounted")
+            {
                 return Err(format!("Erreur lors du démontage : {}", err_msg.trim()));
             }
         }
@@ -849,104 +856,24 @@ pub fn unmount_disk_image(target_mount_or_disk: &str) -> Result<(), String> {
     }
 }
 
-/// Checks whether the current process has elevated root privileges,
-/// or if the user has installed the persistent privileged helper authorization token.
+/// Checks whether the current process is actually running as root (`geteuid() == 0`).
 pub fn check_admin_privileges() -> bool {
     #[cfg(unix)]
     unsafe {
-        if libc::geteuid() == 0 {
-            return true;
-        }
+        libc::geteuid() == 0
     }
-
-    #[cfg(target_os = "macos")]
+    #[cfg(not(unix))]
     {
-        use std::os::unix::fs::MetadataExt;
-        let token_path = Path::new("/Library/Application Support/HardRecover/.privileged_token");
-        if token_path.exists() {
-            if let Ok(meta) = token_path.metadata() {
-                // Must be owned by root (uid == 0) to ensure privileged installation
-                if meta.uid() == 0 {
-                    return true;
-                }
-            }
-        }
+        false
     }
-
-    false
 }
 
-/// Requests elevated administrator privileges natively via macOS Touch ID / Password dialog
-/// and installs the persistent privileged authorization token so password is asked only ONCE.
 pub fn request_admin_privileges() -> Result<bool, String> {
-    if check_admin_privileges() {
-        return Ok(true);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let install_cmd = "mkdir -p '/Library/Application Support/HardRecover' && echo 'hardrecover_authorized' > '/Library/Application Support/HardRecover/.privileged_token' && chown root:admin '/Library/Application Support/HardRecover/.privileged_token' && chmod 644 '/Library/Application Support/HardRecover/.privileged_token' && echo authorized";
-        let script = format!(
-            r#"do shell script "{}" with administrator privileges with prompt "HardRecover requiert une autorisation administrateur pour l'accès direct aux secteurs physiques. Cette autorisation n'est requise qu'une seule fois.""#,
-            install_cmd
-        );
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .map_err(|e| format!("Impossible d'ouvrir le dialogue d'authentification macOS : {}", e))?;
-
-        if output.status.success() {
-            let res = String::from_utf8_lossy(&output.stdout);
-            Ok(res.contains("authorized"))
-        } else {
-            let err = String::from_utf8_lossy(&output.stderr);
-            if err.contains("User canceled") || err.contains("-128") {
-                Ok(false)
-            } else {
-                Err(format!("Erreur d'élévation : {}", err.trim()))
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(false)
-    }
+    Ok(check_admin_privileges())
 }
 
-/// Revokes the persistent privileged helper authorization token.
 pub fn revoke_admin_privileges() -> Result<bool, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let token_path = Path::new("/Library/Application Support/HardRecover/.privileged_token");
-        if token_path.exists() {
-            let script = r#"do shell script "rm -f '/Library/Application Support/HardRecover/.privileged_token'" with administrator privileges with prompt "HardRecover : Confirmation de la désactivation des privilèges administrateur permanents.""#;
-            let output = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .output()
-                .map_err(|e| format!("Erreur lors de la révocation : {}", e))?;
-
-            if output.status.success() {
-                Ok(true)
-            } else {
-                let err = String::from_utf8_lossy(&output.stderr);
-                if err.contains("User canceled") || err.contains("-128") {
-                    Ok(false)
-                } else {
-                    Err(format!("Erreur de révocation : {}", err.trim()))
-                }
-            }
-        } else {
-            Ok(true)
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(true)
-    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -967,95 +894,121 @@ pub struct ForensicCertificateRequest {
     pub device_type: Option<String>,
 }
 
-/// Generates a certified, official forensic inspection report (HTML with print stylesheet)
-/// containing cryptographic hashes (SHA-256 and XXH3), S.M.A.R.T. metrics, and quarantined block maps.
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+fn stream_hash_image_file(path: &Path) -> Result<(String, String), String> {
+    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    set_fd_nocache(&f);
+    let mut sha = Sha256::new();
+    let mut xxh = Xxh3::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        sha.update(&buf[..n]);
+        xxh.update(&buf[..n]);
+    }
+    let sha_hex = format!("{:x}", sha.finalize());
+    let xxh_hex = format!("{:016x}", xxh.digest());
+    Ok((sha_hex, xxh_hex))
+}
+
+/// Generates an honest, XSS-safe technical HTML report with real cryptographic digests
+/// when an image file is present on disk.
 pub fn generate_certified_forensic_report(
     req: &ForensicCertificateRequest,
 ) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    use xxhash_rust::xxh3::xxh3_64;
-
     let out_folder = if req.output_dir.trim().is_empty() {
         std::env::var("HOME")
             .map(|h| PathBuf::from(h).join("Desktop"))
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .unwrap_or_else(|_| std::env::temp_dir())
     } else {
         PathBuf::from(&req.output_dir)
     };
-    if !out_folder.exists() {
-        fs::create_dir_all(&out_folder).map_err(|e| e.to_string())?;
-    }
+    fs::create_dir_all(&out_folder).map_err(|e| e.to_string())?;
 
-    // Compute cryptographic hashes of the disk image or device payload if available
-    let (sha256_hash, xxh3_hash) = if let Some(ref img_path) = req.image_path {
-        let p = Path::new(img_path);
-        if p.exists() {
-            if let Ok(mut f) = File::open(p) {
-                let mut hasher = Sha256::new();
-                let mut buf = vec![0u8; 1024 * 1024]; // 1MB buffer
-                let mut total_read = 0usize;
-                let mut xxh3_acc = 0u64;
+    let stamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let display_date = Local::now().format("%d/%m/%Y à %H:%M:%S").to_string();
 
-                while let Ok(n) = f.read(&mut buf) {
-                    if n == 0 || total_read >= 64 * 1024 * 1024 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                    xxh3_acc ^= xxh3_64(&buf[..n]);
-                    total_read += n;
-                }
-                let sha = format!("{:x}", hasher.finalize());
-                let xxh = format!("{:016x}", xxh3_acc);
-                (sha, xxh)
-            } else {
+    let (sha256_hash, xxh3_hash) = if let Some(ref img_p) = req.image_path {
+        let p = Path::new(img_p);
+        if p.exists() && p.is_file() {
+            stream_hash_image_file(p).unwrap_or_else(|_| {
                 (
-                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-                    "a4f89d3c2b1e00f5".to_string(),
+                    "Erreur de lecture lors du hachage".to_string(),
+                    "Erreur de lecture".to_string(),
                 )
-            }
+            })
         } else {
             (
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-                "a4f89d3c2b1e00f5".to_string(),
+                "Aucune image disque associée à ce rapport".to_string(),
+                "Aucune image disque associée à ce rapport".to_string(),
             )
         }
     } else {
         (
-            "b8f390d45ca1829e2f913d80a3c407892147f891b29a99e71239bf0912d0912a".to_string(),
-            "f940823da04921b7".to_string(),
+            "Aucune image disque associée à ce rapport".to_string(),
+            "Aucune image disque associée à ce rapport".to_string(),
         )
     };
 
-    let safe_device = req
+    let safe_device: String = req
         .device_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect::<String>();
-    let date_str = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let display_date = Local::now().format("%d/%m/%Y à %H:%M:%S").to_string();
-    let file_name = format!("RAPPORT_EXPERTISE_HARDRECOVER_{}_{}.html", safe_device, date_str);
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let file_name = format!("RAPPORT_TECHNIQUE_HARDRECOVER_{}_{}.html", safe_device, stamp);
     let report_file_path = out_folder.join(file_name);
 
     let is_hdd = req.device_type.as_deref() == Some("hdd");
     let compliance_text = if is_hdd {
-        "Le logiciel <strong>HardRecover</strong> certifie que les opérations de lecture ont été réalisées en mode non destructif via les primitives système POSIX <code>O_RDONLY</code> et <code>F_NOCACHE</code>. Aucune tentative d'écriture n'a été autorisée sur le support source durant la phase d'imagerie. Les secteurs défectueux identifiés ont été isolés dans la table d'allocation pour empêcher tout accès ultérieur risquant de bloquer les têtes de lecture magnétiques sur les plateaux."
+        "Audit réalisé localement en mode lecture seule strict (F_NOCACHE). Les mesures reflètent uniquement les lectures physiques exécutées sur les fichiers accessibles du support."
     } else {
-        "Le logiciel <strong>HardRecover</strong> certifie que les opérations de lecture ont été réalisées en mode non destructif via les primitives système POSIX <code>O_RDONLY</code> et <code>F_NOCACHE</code>. Aucune tentative d'écriture n'a été autorisée sur le support source durant la phase d'imagerie. Les blocs défectueux identifiés ont été isolés dans la table d'allocation pour empêcher tout accès ultérieur risquant d'aggraver l'usure de la puce NAND."
+        "Audit réalisé localement en mode lecture seule strict (F_NOCACHE). Aucune écriture ni modification de table de partition n'a été effectuée sur le support analysé."
     };
+
+    let vendor_raw = req
+        .vendor
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Non communiqué par le contrôleur");
+    let serial_raw = req
+        .serial_number
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Non communiqué par le contrôleur");
+    let image_raw = req
+        .image_path
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Aucune image disque associée");
 
     let html_content = format!(
         r#"<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
-  <title>Certificat Forensique — {device_name}</title>
+  <title>Rapport Technique — {device_name}</title>
   <style>
     @media print {{
       body {{ background: #fff !important; color: #000 !important; margin: 0; padding: 20px; }}
       .no-print {{ display: none !important; }}
       .card {{ border: 1px solid #ccc !important; box-shadow: none !important; background: #fff !important; color: #000 !important; }}
-      .header-title {{ color: #000 !important; }}
-      .badge-green {{ border: 1px solid #10B981 !important; color: #059669 !important; }}
     }}
     body {{
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -1065,17 +1018,13 @@ pub fn generate_certified_forensic_report(
       padding: 40px;
       line-height: 1.5;
     }}
-    .container {{
-      max-width: 900px;
-      margin: 0 auto;
-    }}
+    .container {{ max-width: 900px; margin: 0 auto; }}
     .card {{
       background: #1C1C1C;
       border: 1px solid #2F2F2F;
       border-radius: 16px;
       padding: 24px;
       margin-bottom: 24px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     }}
     .header-bar {{
       display: flex;
@@ -1091,22 +1040,16 @@ pub fn generate_certified_forensic_report(
       border-radius: 8px;
       font-size: 11px;
       font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
     }}
     .badge-green {{ background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.4); color: #34D399; }}
-    .badge-amber {{ background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); color: #FBBF24; }}
     .badge-blue {{ background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.4); color: #60A5FA; }}
     h1 {{ font-size: 20px; margin: 0; color: #EDEDEC; font-weight: 800; }}
     h2 {{ font-size: 14px; margin: 0 0 14px 0; color: #F59E0B; text-transform: uppercase; letter-spacing: 0.8px; font-weight: 700; }}
     .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-    .prop-row {{ display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #262626; font-size: 13px; }}
+    .prop-row {{ display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid #262626; font-size: 13px; }}
     .prop-label {{ color: #9B9A97; }}
-    .prop-val {{ font-family: ui-monospace, Menlo, Monaco, monospace; color: #EDEDEC; font-weight: 600; }}
+    .prop-val {{ font-family: ui-monospace, Menlo, Monaco, monospace; color: #EDEDEC; font-weight: 600; text-align: right; }}
     .hash-box {{ background: #0E0E0E; border: 1px solid #242424; padding: 12px; border-radius: 10px; font-family: ui-monospace, Menlo, Monaco, monospace; font-size: 11px; color: #60A5FA; word-break: break-all; margin-top: 8px; }}
-    .signature-area {{ display: flex; justify-content: space-between; margin-top: 40px; padding-top: 24px; border-top: 1px dashed #3A3A3A; }}
-    .sig-block {{ width: 45%; }}
-    .sig-line {{ border-bottom: 1px solid #555; height: 50px; margin-top: 10px; }}
     .btn-print {{ background: #10B981; color: #000; border: none; padding: 10px 18px; border-radius: 10px; font-weight: 700; cursor: pointer; font-size: 13px; }}
   </style>
 </head>
@@ -1116,11 +1059,11 @@ pub fn generate_certified_forensic_report(
       <div class="header-bar">
         <div>
           <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #10B981; font-weight: 800; margin-bottom: 4px;">
-            HARD SUITE — FORENSIC DATA RECOVERY LAB
+            HARD SUITE — HARDRECOVER DIAGNOSTIC
           </div>
-          <h1>Rapport d'Expertise &amp; Certificat d'Intégrité</h1>
+          <h1>Rapport Technique d'Inspection Locale</h1>
           <div style="font-size: 12px; color: #9B9A97; margin-top: 4px;">
-            Généré le {display_date} • Conforme aux spécifications judiciaires et d'assurance
+            Généré le {display_date} • Rapport technique généré localement par HardRecover
           </div>
         </div>
         <div class="no-print">
@@ -1130,10 +1073,9 @@ pub fn generate_certified_forensic_report(
 
       <div class="grid-2">
         <div>
-          <h2>1. Identité Matérielle du Support</h2>
+          <h2>1. Identité du Support</h2>
           <div class="prop-row"><span class="prop-label">Nom Commercial :</span><span class="prop-val">{device_name}</span></div>
           <div class="prop-row"><span class="prop-label">Identifiant BSD macOS :</span><span class="prop-val">/dev/{bsd_name}</span></div>
-          <div class="prop-row"><span class="prop-label">Périphérique Brut :</span><span class="prop-val">/dev/r{bsd_name}</span></div>
           <div class="prop-row"><span class="prop-label">Fabricant / Marque :</span><span class="prop-val">{vendor}</span></div>
           <div class="prop-row"><span class="prop-label">Numéro de Série :</span><span class="prop-val">{serial}</span></div>
           <div class="prop-row"><span class="prop-label">Système de Fichiers :</span><span class="prop-val">{file_system}</span></div>
@@ -1141,30 +1083,25 @@ pub fn generate_certified_forensic_report(
         </div>
 
         <div>
-          <h2>2. Audit Physique &amp; Santé Cellulaire</h2>
+          <h2>2. Audit de Lecture &amp; Politique d'Accès</h2>
           <div class="prop-row"><span class="prop-label">Statut S.M.A.R.T. :</span><span class="prop-val badge badge-green">{smart_status}</span></div>
-          <div class="prop-row"><span class="prop-label">Score de Santé Global :</span><span class="prop-val badge badge-green">{health_score} %</span></div>
-          <div class="prop-row"><span class="prop-label">Secteurs Défectueux Détectés :</span><span class="prop-val">{bad_sectors}</span></div>
-          <div class="prop-row"><span class="prop-label">Clusters Mis en Quarantaine :</span><span class="prop-val">{quarantined_clusters}</span></div>
-          <div class="prop-row"><span class="prop-label">Test Contrefaçon Flash :</span><span class="prop-val badge badge-blue">Authentique (Pas de Wrap-around)</span></div>
-          <div class="prop-row"><span class="prop-label">Technologie d'Isolation :</span><span class="prop-val">Allocation Monopartition / Table FAT</span></div>
+          <div class="prop-row"><span class="prop-label">Indice observé :</span><span class="prop-val badge badge-green">{health_score} %</span></div>
+          <div class="prop-row"><span class="prop-label">Erreurs / Latences Critiques :</span><span class="prop-val">{bad_sectors}</span></div>
+          <div class="prop-row"><span class="prop-label">Test Contrefaçon Écriture :</span><span class="prop-val badge badge-blue">Non exécuté (Mode Lecture Seule Strict)</span></div>
+          <div class="prop-row"><span class="prop-label">Politique d'Accès :</span><span class="prop-val">Lecture seule stricte (aucune écriture sur le support)</span></div>
         </div>
       </div>
     </div>
 
     <div class="card">
-      <h2>3. Image Disque Forensique &amp; Empreintes Cryptographiques</h2>
-      <p style="font-size: 12px; color: #9B9A97; margin-bottom: 12px;">
-        L'image de sauvetage a été extraite via le moteur de clonage adaptatif 5 passes (Sweep &rarr; Trim &rarr; Scrape &rarr; Retry &rarr; Map). Les empreintes ci-dessous garantissent l'inviolabilité probatoire des données extraites.
-      </p>
-
+      <h2>3. Image Disque &amp; Empreintes Cryptographiques</h2>
       <div style="font-size: 12px; font-weight: 700; color: #EDEDEC; margin-top: 10px;">
-        Empreinte SHA-256 (NIST FIPS 180-4) :
+        Empreinte SHA-256 :
       </div>
       <div class="hash-box">{sha256_hash}</div>
 
       <div style="font-size: 12px; font-weight: 700; color: #EDEDEC; margin-top: 14px;">
-        Empreinte Ultrarapide XXH3-64 :
+        Empreinte XXH3-64 :
       </div>
       <div class="hash-box">{xxh3_hash}</div>
 
@@ -1175,42 +1112,28 @@ pub fn generate_certified_forensic_report(
     </div>
 
     <div class="card">
-      <h2>4. Déclaration de Conformité Forensique</h2>
+      <h2>4. Méthodologie &amp; Portée</h2>
       <p style="font-size: 12px; color: #9B9A97; line-height: 1.6;">
         {compliance_text}
       </p>
-
-      <div class="signature-area">
-        <div class="sig-block">
-          <div style="font-size: 12px; font-weight: 700; color: #EDEDEC;">Responsable Laboratoire / Opérateur :</div>
-          <div class="sig-line"></div>
-          <div style="font-size: 11px; color: #777; margin-top: 4px;">Signature et Tampon</div>
-        </div>
-        <div class="sig-block">
-          <div style="font-size: 12px; font-weight: 700; color: #EDEDEC;">Client / Demandeur :</div>
-          <div class="sig-line"></div>
-          <div style="font-size: 11px; color: #777; margin-top: 4px;">Pour accord et prise en charge</div>
-        </div>
-      </div>
     </div>
   </div>
 </body>
 </html>"#,
-        device_name = req.device_name,
-        display_date = display_date,
-        bsd_name = req.bsd_name,
-        vendor = req.vendor.clone().unwrap_or_else(|| "Générique / Standard Flash".to_string()),
-        serial = req.serial_number.clone().unwrap_or_else(|| "SN-4829-AF91-0392".to_string()),
-        file_system = req.file_system,
-        total_formatted = format_bytes_display(req.total_bytes),
-        smart_status = req.smart_status,
+        device_name = escape_html(&req.device_name),
+        display_date = escape_html(&display_date),
+        bsd_name = escape_html(&req.bsd_name),
+        vendor = escape_html(vendor_raw),
+        serial = escape_html(serial_raw),
+        file_system = escape_html(&req.file_system),
+        total_formatted = escape_html(&format_bytes_display(req.total_bytes)),
+        smart_status = escape_html(&req.smart_status),
         health_score = req.health_score,
         bad_sectors = req.bad_sectors_count,
-        quarantined_clusters = req.quarantined_clusters,
-        sha256_hash = sha256_hash,
-        xxh3_hash = xxh3_hash,
-        image_path = req.image_path.clone().unwrap_or_else(|| "Clonage direct en mémoire".to_string()),
-        compliance_text = compliance_text,
+        sha256_hash = escape_html(&sha256_hash),
+        xxh3_hash = escape_html(&xxh3_hash),
+        image_path = escape_html(image_raw),
+        compliance_text = escape_html(compliance_text),
     );
 
     fs::write(&report_file_path, html_content).map_err(|e| e.to_string())?;
@@ -1230,4 +1153,3 @@ fn format_bytes_display(bytes: u64) -> String {
         format!("{} octets", bytes)
     }
 }
-

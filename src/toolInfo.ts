@@ -3,8 +3,8 @@ export interface ToolInfo {
   number: string;
   title: string;
   badge: string;
-  accentColor: string; // Tailwind color class like 'text-[#FBBF24]', 'text-[#60A5FA]', etc.
-  bgLightColor: string; // Tailwind background class for icon badge
+  accentColor: string;
+  bgLightColor: string;
   simpleExplanation: string;
   technicalDetails: {
     overview: string;
@@ -18,47 +18,30 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool1: {
     id: "tool1",
     number: "Outil 1",
-    title: "Cloneur Forensique Adaptatif (5 Passes)",
-    badge: "Sauvetage Multi-Passes & Saut Exponentiel",
+    title: "Imageur de Sauvetage Lecture Seule",
+    badge: "Copie Binaire F_NOCACHE & Images macOS",
     accentColor: "text-[#FBBF24]",
     bgLightColor: "bg-[#F59E0B]/15 text-[#FBBF24] border-[#F59E0B]/30",
     simpleExplanation:
-      "Si votre carte SD ou disque dur commence à faiblir et fait planter votre Mac lors d'une copie, cet outil extrait vos données en sécurité vers un fichier image (.img). Au lieu d'insister bêtement sur les secteurs morts (ce qui risquerait d'achever le disque), il saute immédiatement par-dessus la panne pour copier d'abord tout ce qui est en bon état, puis revient détourer les dégâts avec une extrême précaution.",
+      "Crée une image de sauvetage en lecture seule (.dmg via hdiutil pour les volumes montés, ou .img binaire pour les images brutes) sur un autre disque sans jamais écrire sur le support source.",
     technicalDetails: {
       overview:
-        "Cloneur bas niveau conçu pour contourner les blocages du noyau macOS. Il communique directement avec le périphérique brut via `/dev/rdisk*` en mode non bufferisé (`F_NOCACHE`), empêchant le système d'exploitation de figer l'ordinateur lors des erreurs d'E/S (I/O Errors).",
+        "Extraction séquentielle non bufferisée (F_NOCACHE) pour les fichiers/images brutes avec contournement adaptatif des erreurs de lecture, ou création d'image UDRO lecture seule via macOS hdiutil pour les volumes montés.",
       keyMechanisms: [
         {
-          title: "Phase 1 — Balayage Rapide (Fast Sweep)",
-          desc: "Lecture par blocs de grande taille (ex. 1 Mo). Dès qu'un bloc met plus de temps que la normale ou échoue, le moteur applique un saut exponentiel (S_k = S_0 × 2^k) vers l'avant pour sauver immédiatement les zones saines restantes.",
+          title: "Saut adaptatif sur erreur de lecture (images brutes)",
+          desc: "En cas d'erreur d'E/S sur une image brute ou un périphérique lisible, le moteur calcule un saut S_k = min(S_max, S_0 * 2^k) et consigne les blocs manquants dans le fichier .hrmap.json.",
         },
         {
-          title: "Phase 2 & 3 — Détourage (Trimming) & Grattage (Scraping)",
-          desc: "Le moteur revient aux frontières des zones sautées, d'avant en arrière, pour isoler précisément le premier et le dernier secteur défectueux au secteur près (512 ou 4096 octets).",
-        },
-        {
-          title: "Phase 4 & 5 — Réessai Ciblé & Remplissage Neutre",
-          desc: "Réessais ciblés uniquement sur les en-têtes critiques. Les secteurs irrémédiablement morts sont comblés par des octets neutres 0x00 et consignés dans un journal forensique `.hrmap` pour que la récupération sache exactement quelles données manquent.",
+          title: "Montage Finder en lecture seule",
+          desc: "Les images créées peuvent être montées avec `hdiutil attach -readonly` pour explorer leur contenu sans solliciter le support d'origine.",
         },
       ],
-      diagram: `+-------------------------------------------------------------+
-|               PIPELINE DE CLONAGE ADAPTATIF 5 PASSES        |
-+-------------------------------------------------------------+
- [LBA 0] ========[Secteurs Sains (100% Débit)]========> [Erreur LBA]
-                                                              |
-                                             +----------------+
-                                             | Saut Exponentiel S_k
-                                             v
- [LBA Saut] ====[Suite des zones saines sauvées]=======> [Fin Disque]
-                                                              |
-   Phase 2 (Trimming) <---------------------------------------+
-   Phase 3 (Scraping granulaire 512o / 4Ko)
-   Phase 4 (Targeted Retry)
-   Phase 5 (Génération du fichier .img + journal .hrmap)`,
+      diagram:
+        "Support Source (Lecture Seule) -> Copie / Image UDRO ou .img -> Verification F_NOCACHE -> Montage Read-Only",
       benefits: [
-        "Sauve 90% à 99% des données saines avant que le support ne rende l'âme.",
-        "Zéro blocage ou gel du Mac grâce aux appels POSIX asynchrones non mis en cache.",
-        "Reprise possible à tout moment grâce au journal de progression `.hrmap`.",
+        "Aucune écriture effectuée sur le support source.",
+        "Journal de secteurs et progression enregistré en JSON.",
       ],
     },
   },
@@ -66,41 +49,29 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool2: {
     id: "tool2",
     number: "Outil 2",
-    title: "Chirurgien de Partitions & Systèmes de Fichiers",
-    badge: "Reconstruction GPT / ExFAT / APFS",
+    title: "Analyseur d'Arborescence ExFAT & Corbeilles",
+    badge: "Lecture Directe d'Entrées & Récupération",
     accentColor: "text-[#34D399]",
     bgLightColor: "bg-[#10B981]/15 text-[#34D399] border-[#10B981]/30",
     simpleExplanation:
-      "Rend de nouveau lisible un support qui affiche « Disque non initialisé » ou « Illisible » après un retrait sans éjection ou une coupure de courant. Il répare l'annuaire et la table des matières de la carte sans effacer vos fichiers.",
+      "Explore les volumes montés (y compris les dossiers cachés .Trashes et .Trash) ainsi que les tables d'entrées ExFAT dans les images disque brutes pour retrouver vos médias et noms d'origine.",
     technicalDetails: {
       overview:
-        "Restauration géométrique et binaire des structures de boot et d'annuaires de systèmes de fichiers (ExFAT, FAT32, APFS, HFS+, GPT) sans toucher aux données utilisateur.",
+        "Parcours non destructif des volumes accessibles et décodage des jeux d'entrées de répertoires ExFAT (0x85 / 0x05, 0xC0, 0xC1) à l'intérieur des images disque.",
       keyMechanisms: [
         {
-          title: "Restauration VBR ExFAT (Backup VBR Copy)",
-          desc: "Sur ExFAT, les secteurs 0 à 11 contiennent le Volume Boot Record principal, et les secteurs 12 à 23 contiennent une copie de secours exacte. Le moteur compare les deux, recalcule le checksum 32-bit (secteur 11) et restaure le boot record sans formatage.",
+          title: "Restitution d'entrées ExFAT",
+          desc: "Décode les entrées UTF-16LE et longueurs de fichiers issues des tables de répertoires ExFAT présentes dans une image disque.",
         },
         {
-          title: "Synchronisation GPT Primaire & Secondaire",
-          desc: "Vérifie l'en-tête de partition GUID (LBA 1) contre le backup situé au dernier secteur du disque (LBA N-1). En cas d'altération, la table des partitions est resynchronisée avec recalcul des sommes CRC32.",
-        },
-        {
-          title: "Montage Virtuel en Mémoire Vive (RAM)",
-          desc: "Permet de naviguer dans les dossiers et d'extraire les fichiers d'un disque endommagé en prévisualisation mémoire sans écrire un seul octet physique sur le support d'origine.",
+          title: "Exploration des corbeilles volume",
+          desc: "Scanne également `.Trashes` et `.Trash` tout en filtrant les métadonnées parasites AppleDouble (`._*`).",
         },
       ],
-      diagram: `+-------------------------------------------------------------+
-|             RECONSTRUCTION STRUCTURELLE EXFAT / GPT         |
-+-------------------------------------------------------------+
- [LBA 0-11: VBR Primaire Corrompu]    [LBA 12-23: Backup VBR Sain]
-             |                                    |
-             | <-------- Copie & Validation ------+
-             v           du Checksum 32-bit
- [Boot Record Réhabilité] ===> Volume à nouveau montable & lisible`,
+      diagram: "Volume ou Image Disque -> Lecture Entrées ExFAT / .Trashes -> Export vers Disque Sain",
       benefits: [
-        "Récupère instantanément l'accès à vos fichiers sans passer par un scan de plusieurs heures.",
-        "Conserve l'arborescence des dossiers et les noms d'origine des fichiers.",
-        "Totalement non destructif pour les médias stockés.",
+        "Bloque strictement l'exportation vers le support source.",
+        "Préserve les noms de fichiers originaux quand l'annuaire est lisible.",
       ],
     },
   },
@@ -108,40 +79,29 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool3: {
     id: "tool3",
     number: "Outil 3",
-    title: "Moteur de File Carving Vectoriel & Défragmenteur",
-    badge: "Extraction Brute SIMD & Réassemblage",
+    title: "Moteur de File Carving par Signatures",
+    badge: "Extraction d'En-têtes & Tailles Réelles",
     accentColor: "text-[#F59E0B]",
     bgLightColor: "bg-[#F59E0B]/15 text-[#FBBF24] border-[#F59E0B]/30",
     simpleExplanation:
-      "Si la carte a été formatée par erreur ou si le système de fichiers est totalement anéanti, ce moteur fouille chaque recoin brut du disque. Il reconnaît la signature de chaque type de fichier (vidéos, photos RAW, sons) et les réassemble même si la caméra les a éparpillés en morceaux sur la carte.",
+      "Recherche les signatures binaires de photos JPEG (FF D8 FF ... FF D9) et de conteneurs vidéo ISO-BMFF (.MOV/.MP4 'ftyp') à l'intérieur d'une image disque brute pour en extraire les octets réels.",
     technicalDetails: {
       overview:
-        "Moteur de fouille binaire brute ultra-rapide optimisé avec les instructions SIMD Apple Silicon (ARM NEON), capable d'ingérer plus de 3 Go/s de données brutes pour extraire les flux multimédias orphelins.",
+        "Analyse binaire par signatures magiques, mesure de l'entropie de Shannon et parcours des atomes racine ISO-BMFF ou du marqueur de fin JPEG EOI (FF D9).",
       keyMechanisms: [
         {
-          title: "Balayage Multi-Signatures Aho-Corasick",
-          desc: "Reconnaissance simultanée en un seul passage mémoire de plus de 60 signatures binaires (Magic Bytes) d'en-têtes et pieds de page (.MOV, .MP4, .BRAW, .ARW, .CR3, .WAV...).",
+          title: "Mesure de taille réelle",
+          desc: "Pour chaque signature JPEG, localise le marqueur de fin FF D9 ; pour chaque signature QuickTime/MP4, additionne les tailles d'atomes contigus afin d'extraire la plage exacte d'octets.",
         },
         {
-          title: "Défragmentation par Entropie de Shannon",
-          desc: "Sur les cartes ExFAT de caméras, la vidéo et l'audio sont souvent entrelacés dans des blocs séparés. Le moteur calcule l'entropie H(C) = -∑ p(x) log2 p(x) et détecte les unités NAL H.264/H.265 pour recoller les fragments du même clip vidéo dans l'ordre chronologique.",
+          title: "Scoring de continuité par divergence de Jensen-Shannon",
+          desc: "Évalue la cohérence statistique entre blocs adjacents grâce au module `math_engine`.",
         },
       ],
-      diagram: `+-------------------------------------------------------------+
-|              CARVING SIMD & DÉFRAGMENTATION MULTIMÉDIA       |
-+-------------------------------------------------------------+
- Flux Brut LBA : [Video Frag 1] [Audio Frag 1] [Proxy Frag 1] [Video Frag 2]
-                       |              |              |              |
- Entropie Shannon ===> [H = 7.82]     [H = 6.45]     [H = 7.10]     [H = 7.84]
- NAL Parser     ===> [Slice NAL]     [PCM Samples]  [Low-Res NAL]  [Slice NAL]
-                       |                                            |
- Assemblage    ====> +--------------------------------------------+
-                     v
-             [Clip Vidéo Complet Reconstitué Sans Rupture]`,
+      diagram: "Image Brute -> Recherche Signatures (ftyp / FF D8 FF) -> Mesure Taille -> Extraction Plage d'Octets",
       benefits: [
-        "Récupère les vidéos fragmentées qui coupent d'habitude après 1 seconde avec les logiciels classiques.",
-        "Scanne à la vitesse matérielle maximale de votre lecteur de carte ou port Thunderbolt.",
-        "Capacité de prévisualiser les fichiers trouvés avant même de les exporter.",
+        "Extraction directe des vrais octets depuis l'offset détecté dans l'image.",
+        "Calcul d'entropie et détection des fichiers proxys (.THM / .LRF).",
       ],
     },
   },
@@ -149,45 +109,29 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool4: {
     id: "tool4",
     number: "Outil 4",
-    title: "Synthétiseur Chirurgical de Conteneurs Vidéo",
-    badge: "Reconstruction d'Atome moov Sans Ré-encodage",
+    title: "Réparation de Conteneurs Vidéo Sans Ré-encodage",
+    badge: "Reconstruction d'Atomes moov / stbl",
     accentColor: "text-[#60A5FA]",
     bgLightColor: "bg-[#3B82F6]/15 text-[#60A5FA] border-[#3B82F6]/30",
     simpleExplanation:
-      "Répare les vidéos (.MOV, .MP4, .MXF, .BRAW) qui refusent de s'ouvrir parce que la caméra a été éteinte brusquement ou que la batterie est tombée à plat pendant le tournage. Il reconstruit l'en-tête technique sans toucher à l'image : zéro perte de qualité, réparation en 2 secondes.",
+      "Répare les rushs vidéo (.MOV, .MP4, .BRAW, .MXF) dont l'index `moov` est manquant ou tronqué suite à une coupure caméra, en s'appuyant sur les trames `mdat` et un éventuel fichier sain de référence.",
     technicalDetails: {
       overview:
-        "Chirurgie binaire des conteneurs ISO-BMFF / QuickTime. Dans un fichier vidéo corrompu, 99.9% des images sont intactes dans le bloc `mdat`, mais l'annuaire d'indexation `moov` n'a pas été écrit avant la coupure d'alimentation.",
+        "Chirurgie binaire des conteneurs ISO-BMFF / QuickTime : reconstruction de l'annuaire `moov` et des tables `stsd`, `stsz`, `co64` sans toucher aux images vidéo d'origine.",
       keyMechanisms: [
         {
-          title: "Mode Autonome (Blind Container Synthesis)",
-          desc: "Scanne les unités binaires du flux brut (SPS/PPS pour H.264/H.265, en-tête de trame `icpf` pour ProRes) pour identifier le framerate, la résolution, le profil couleur, puis génère un atome `moov` complet conforme aux normes internationales.",
+          title: "Mode Référence ou Autonome",
+          desc: "Duplique les descriptions codec (`avcC`, `hvcC`, `apch`) depuis un fichier sain de la même caméra ou détecte les unités NAL/ProRes directement dans le flux `mdat`.",
         },
         {
-          title: "Mode Référence (Fichier Sain de la Même Caméra)",
-          desc: "L'utilisateur glisse un fichier sain enregistré avec la même caméra. Le moteur duplique la structure des pistes (`trak`) et greffe les tables de description (`stsd` : `avcC`, `hvcC`, `apch`, profil colorimétrique `colr`), puis recalcule les tables de synchronisation (`stsz`, `co64`).",
-        },
-        {
-          title: "Assainissement de Bitstream (NAL Sanitizer)",
-          desc: "Si des octets défectueux sont présents au milieu d'une trame, ils sont purgés ou complétés par une trame de maintien propre afin d'éviter tout plantage dans DaVinci Resolve ou Final Cut Pro.",
+          title: "Synchronisation Audio / Vidéo",
+          desc: "Recalcule les tables d'échantillons pour restaurer la lecture dans QuickTime, DaVinci Resolve et Final Cut Pro.",
         },
       ],
-      diagram: `+-------------------------------------------------------------+
-|             SYNTHÈSE CHIRURGICALE D'ATOME MOOV (SANS PERTE) |
-+-------------------------------------------------------------+
- [Fichier Corrompu : ftyp ? | mdat (10 Go de vidéo brute intacte) | moov MANQUANT !]
-                                   |
-                Extraction des trames & codecs (SPS/PPS/NAL)
-                                   v
-             [Génération Mathématique de l'Atome moov]
-                 ├── trak (Vidéo : stsd avcC/hvcC, stsz, co64)
-                 └── trak (Audio : stsd PCM/AAC, stts)
-                                   v
- [Fichier Réparé : ftyp | moov (Index) | mdat] ===> 100% Lisible sans ré-encodage`,
+      diagram: "Fichier Corrompu (mdat sans moov) + Référence Optionnelle -> Synthèse moov -> Nouveau Fichier Lisible",
       benefits: [
-        "Conservation stricte de la qualité vidéo d'origine (Bit-Perfect, aucun ré-encodage).",
-        "Compatible ProRes, H.264, H.265 (10-bit 4:2:2), Blackmagic RAW, REDCODE RAW.",
-        "Fonctionne en quelques secondes même sur des rushs de plusieurs dizaines de gigaoctets.",
+        "Aucune perte de qualité : zéro ré-encodage vidéo.",
+        "Le fichier source d'origine n'est jamais modifié sur place.",
       ],
     },
   },
@@ -195,45 +139,28 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool5: {
     id: "tool5",
     number: "Outil 5",
-    title: "Docteur Photo RAW & JPEG",
-    badge: "Réparation IFD & Sauvetage Pleine Définition",
+    title: "Réparation Photo RAW & JPEG",
+    badge: "Restauration Structurelle TIFF/IFD & Aperçu",
     accentColor: "text-[#A78BFA]",
     bgLightColor: "bg-[#8B5CF6]/15 text-[#C4B5FD] border-[#8B5CF6]/30",
     simpleExplanation:
-      "Répare les photos RAW (.ARW, .CR3, .NEF, .DNG) ou JPEG qui affichent des lignes décalées, des couleurs bizarres ou un message d'erreur d'ouverture. En cas de dégâts graves, il sait également extraire l'aperçu pleine résolution intégré dans le fichier.",
+      "Inspecte les en-têtes TIFF/IFD des fichiers RAW (.ARW, .CR3, .NEF, .DNG) et JPEG corrompus, répare la structure ou extrait le flux JPEG intégré lorsque l'image brute est endommagée.",
     technicalDetails: {
       overview:
-        "Réparation structurelle de la hiérarchie TIFF/IFD des fichiers RAW de capteurs photo et reconstruction des marqueurs de trames JPEG.",
+        "Analyse structurelle des pointeurs IFD0/ExifIFD et extraction des segments JPEG embarqués.",
       keyMechanisms: [
         {
-          title: "Reconstruction d'Annuaires IFD (Image File Directories)",
-          desc: "Répare les pointeurs détruits `IFD0`, `SubIFD` et `ExifIFD` qui indiquent où se trouvent la matrice de Bayer et les métadonnées de l'appareil photo.",
+          title: "Vérification d'en-tête TIFF & JPEG",
+          desc: "Contrôle l'alignement des marqueurs SOI/EOI et des répertoires IFD.",
         },
         {
-          title: "Chirurgie de Marqueurs JPEG & Tables Huffman",
-          desc: "Si une photo JPEG est tronquée ou a perdu son en-tête, greffe des tables de quantification (`DQT`) et de Huffman (`DHT`) compatibles, et resynchronise les marqueurs de redémarrage `RST0` à `RST7`.",
-        },
-        {
-          title: "Extraction d'Aperçu Haute Résolution (Zero-Loss Preview Salvage)",
-          desc: "Si la matrice RAW est trop endommagée pour être dé-matricée, extrait l'image JPEG pleine résolution embarquée par le processeur d'image de l'appareil.",
+          title: "Récupération d'aperçu intégré",
+          desc: "Extrait l'image JPEG pleine résolution intégrée dans les RAW capteurs en cas d'endommagement de la matrice.",
         },
       ],
-      diagram: `+-------------------------------------------------------------+
-|             RECONSTRUCTION STRUCTURELLE PHOTO RAW / JPEG    |
-+-------------------------------------------------------------+
- [Fichier RAW Corrompu] ──> [Vérification IFD / Header TIFF]
-                                  │
-          ┌───────────────────────┴───────────────────────┐
-          v                                               v
- [IFD Réparable]                                 [Matrice Capteur HS]
-        │                                                 │
-        v                                                 v
- [Réalignement Pointeurs & DNG]                 [Extraction Aperçu Pleine Def]
-        │                                                 │
-        └─────────────────> [Photo Sauvée] <──────────────┘`,
+      diagram: "Photo RAW / JPEG -> Diagnostic IFD & Marqueurs -> Réparation ou Extraction JPEG",
       benefits: [
-        "Restaure les photos de mariage, de shooting ou de reportage jugées perdues.",
-        "Supporte tous les constructeurs majeurs (Sony ARW, Canon CR2/CR3, Nikon NEF, Fuji RAF).",
+        "Compatible Sony ARW, Canon CR2/CR3, Nikon NEF, DNG et JPEG.",
       ],
     },
   },
@@ -241,36 +168,28 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool6: {
     id: "tool6",
     number: "Outil 6",
-    title: "Réparateur Audio Broadcast (WAV / BWF / RF64)",
-    badge: "Reconstruction RIFF & Inférence de Variance",
+    title: "Réparateur Audio Broadcast (WAV / BWF)",
+    badge: "Reconstruction d'En-tête RIFF & Inférence PCM",
     accentColor: "text-[#38BDF8]",
     bgLightColor: "bg-[#0284C7]/15 text-[#38BDF8] border-[#0284C7]/30",
     simpleExplanation:
-      "Répare les pistes audio professionnelles (.WAV, .BWF) coupées brutalement lors d'une prise de son sur un enregistreur de tournage (Sound Devices, Zoom, Tascam). Il recalcule la durée exacte et réaligne le son pour qu'il s'ouvre proprement dans Pro Tools ou votre logiciel de montage.",
+      "Répare les fichiers audio .WAV et .BWF coupés en cours d'enregistrement en recalculant la taille exacte des chunks RIFF/data sans ré-encodage.",
     technicalDetails: {
       overview:
-        "Reconstruction déterministe d'en-têtes de conteneurs RIFF/WAV et analyse statistique d'autocorrélation pour les flux PCM bruts orphelins.",
+        "Recalcul des tailles RIFF et `data` et estimation statistique de la configuration PCM par autocorrélation quand l'en-tête est absent.",
       keyMechanisms: [
         {
-          title: "Correction de Longueur de Chunk data",
-          desc: "Lors d'une extinction brutale, la taille du sous-chunk `data` reste souvent à 0 ou 0xFFFFFFFF, empêchant la lecture. Le moteur mesure la masse binaire restante et recalcule la taille exacte.",
+          title: "Correction de chunk data",
+          desc: "Remplace les longueurs nulles ou à `0xFFFFFFFF` par la taille réelle du flux PCM mesurée sur disque.",
         },
         {
-          title: "Inférence Statistique de Format PCM Brut",
-          desc: "Même si les premiers kilo-octets du fichier ont été effacés, le moteur détermine la profondeur de bits (16, 24 ou 32 bits virgule flottante), la fréquence d'échantillonnage et le nombre de pistes (mono, stéréo, polyphonique 4 à 32 pistes) en analysant la variance inter-échantillons.",
+          title: "Inférence PCM",
+          desc: "Analyse l'écart inter-échantillons pour estimer la profondeur en bits et le nombre de canaux.",
         },
       ],
-      diagram: `+-------------------------------------------------------------+
-|            RECONSTRUCTION D'EN-TÊTE AUDIO RIFF / BWF        |
-+-------------------------------------------------------------+
- [Fichier WAV Tronqué] : RIFF Header (data size = 0x00000000)
-                                 │
-           Calcul de la masse brute restante & format PCM
-                                 v
- [En-tête RIFF / BWF Reconstruit avec métadonnées bext & iXML préservées]`,
+      diagram: "WAV/BWF Tronqué -> Mesure Taille Réelle + Autocorrélation PCM -> En-tête RIFF Valide",
       benefits: [
-        "Sauve les prises de son de tournage sans artefacts ni distorsion.",
-        "Compatible avec les enregistrements Broadcast Wave (BWF) multicanaux.",
+        "Restaure instantanément la lisibilité dans Pro Tools, Logic Pro et DaVinci Resolve.",
       ],
     },
   },
@@ -278,137 +197,30 @@ export const TOOLS_DATABASE: Record<string, ToolInfo> = {
   tool7: {
     id: "tool7",
     number: "Outil 7",
-    title: "Latence de Surface & Test Anti-Contrefaçon (NAND & HDD)",
-    badge: "Sonde LBA Modulo 2ᵏ • Détection Bit-Rot & Pistes Fatiguées",
+    title: "Profilage de Latence de Lecture (F_NOCACHE)",
+    badge: "Mesure Physique Non Destructive & S.M.A.R.T.",
     accentColor: "text-[#60A5FA]",
     bgLightColor: "bg-[#3B82F6]/15 text-[#60A5FA] border-[#3B82F6]/30",
     simpleExplanation:
-      "Cet outil mesure la santé réelle de votre support (carte SD, SSD, NVMe ou disque dur HDD) et vérifie qu'il ne s'agit pas d'une contrefaçon. Il mesure le temps de réponse physique en microsecondes pour détecter l'usure invisible bien avant la panne (fatigue de charge électrique sur mémoire flash ou micro-blocages de têtes sur HDD), et s'assure que la capacité annoncée est authentique.",
+      "Mesure le temps réel de lecture physique en microsecondes sur les fichiers présents sur le support (en contournant le cache RAM macOS via F_NOCACHE) et relève l'état S.M.A.R.T. remonté par macOS.",
     technicalDetails: {
       overview:
-        "Sondage de surface non destructif en 240 points LBA réguliers via des lectures directes POSIX `pread()` non mises en cache (`F_NOCACHE`). Différencie automatiquement la mémoire Flash électronique (latence de grille flottante) des disques mécaniques HDD (latence de piste magnétique et repositionnement de tête).",
+        "Échantillonnage jusqu'à 240 lectures directes de 64 Ko réparties sur les fichiers du support avec `F_NOCACHE` activé, calcul des percentiles et de l'entropie de Shannon, sans aucune écriture.",
       keyMechanisms: [
         {
-          title: "Classification Flash (SD / SSD / NVMe) vs HDD (Plateaux)",
-          desc: "• Vert (< 1 ms) : Cellules Flash ou pistes HDD saines et réactives.\n• Bleu (1 à 5 ms) : Temps d'accès nominal.\n• Jaune (5 à 50 ms) : Fatigue matérielle. Sur Flash : perte progressive de charge électrique et réessais LDPC. Sur HDD : affaiblissement de flux magnétique et réessais de positionnement de tête.\n• Rouge (> 50 ms ou Timeout) : Cellule flash morte ou secteur LBA défectueux (Bad Sector).",
+          title: "Classification par latence mesurée",
+          desc: "Rapide (< 1 ms), Normale (1-10 ms), Lente (10-50 ms), Critique (>= 50 ms ou erreur I/O). En cas de doute, une sonde secondaire de 16 pages 4K est exécutée sur la zone.",
         },
         {
-          title: "Test Anti-Contrefaçon par Sonde Modulo 2ᵏ",
-          desc: "Les fausses cartes mémoires ou disques trafiqués modifient le firmware pour faire boucler les adresses au-delà de leur capacité réelle. HardRecover sonde les frontières de clusters hauts et vérifie l'absence de rebouclage cyclique.",
-        },
-        {
-          title: "Micro-Scan Chirurgical Automatique",
-          desc: "Dès qu'une sonde relève une latence anormale (jaune ou rouge), le moteur zoome automatiquement sur la tranche concernée (secteur par secteur) pour localiser la panne avec une précision chirurgicale.",
+          title: "Lecture seule stricte",
+          desc: "Contrairement à un test d'écriture/relecture (disponible dans HardHub sur support non sensible), cet outil n'écrit aucun octet sur votre média.",
         },
       ],
-      diagram: `+-------------------------------------------------------------+
-|         TEST DE LATENCE MICROSECONDE & ANTI-CONTREFAÇON     |
-+-------------------------------------------------------------+
- Répartition de 240 Sondes LBA sur toute la capacité du support :
- [Sonde 1] ---- [Sonde 2] ---- [Sonde 3] ... ---- [Sonde 240]
-     │              │              │                    │
-  < 1 ms         1-5 ms        5-50 ms                > 50 ms
- [Sain]         [Normal]       [Fatigue]            [Critique]
-                                   │                    │
-                  Déclenche : [Outil 9: Refresh]   [Outil 8: Quarantaine]`,
+      diagram: "Volume Source (Read-Only) -> Jusqu'à 240 Lectures F_NOCACHE -> Moyenne, P99, Entropie & S.M.A.R.T.",
       benefits: [
-        "Détecte la dégradation d'une carte mémoire ou d'un disque dur des mois avant la perte de données.",
-        "Prouve immédiatement l'authenticité ou la contrefaçon d'un support neuf.",
-        "Totalement non destructif : s'exécute en quelques secondes en lecture seule pure.",
-      ],
-    },
-  },
-
-  tool8: {
-    id: "tool8",
-    number: "Outil 8",
-    title: "Quarantaine des Blocs Défectueux & Réhabilitation",
-    badge: "Bad Block Exclusion & Remap d'Allocation",
-    accentColor: "text-[#F59E0B]",
-    bgLightColor: "bg-[#F59E0B]/15 text-[#F59E0B] border-[#F59E0B]/30",
-    simpleExplanation:
-      "Si votre carte SD, SSD ou disque dur possède des secteurs défectueux isolés (blocs rouges) qui provoquent des erreurs d'écriture ou font planter votre caméra, cet outil les condamne et les neutralise définitivement. Votre support conserve 1 SEULE et unique partition propre reconnue nativement par vos appareils (aucune découpe en deux morceaux). Si la réserve matérielle est épuisée, HardRecover vous oriente vers le clonage d'urgence (.img).",
-    technicalDetails: {
-      overview:
-        "Neutralisation physique et logique des blocs défectueux adaptée à chaque support : exclusion d'Erase Blocks sur mémoire Flash, ou verrouillage de secteurs LBA sur disques magnétiques HDD.",
-      keyMechanisms: [
-        {
-          title: "Garantie Partition Unique (Zéro Découpe)",
-          desc: "Contrairement aux utilitaires classiques qui scindent le support en partitions inutilisables pour les caméras professionnelles, HardRecover conserve une géométrie continue en isolant chirurgicalement les clusters morts dans la table d'allocation.",
-        },
-        {
-          title: "Spécificité Flash : Exclusion d'Erase Block (4 à 16 Mo)",
-          desc: "Dans la mémoire flash NAND, les cellules s'organisent en blocs physiques d'effacement. Isoler le bloc entier empêche la contamination des cellules adjacentes et soulage le contrôleur.",
-        },
-        {
-          title: "Spécificité HDD : Exclusion LBA & Protection Mécanique",
-          desc: "Sur les disques à plateaux, le marquage des secteurs défectueux dans le bitmap empêche les têtes de lecture d'atterrir ou de buter sur les zones dégradées du plateau, évitant la propagation de rayures physiques.",
-        },
-        {
-          title: "Seuil de Sécurité & Défaillance Critique",
-          desc: "Si plus de 5 blocs physiques sont morts, la réserve interne (Spare Blocks) est saturée. L'outil bloque toute tentative de réparation illusoire et vous oriente vers le clonage d'urgence (.img).",
-        },
-      ],
-      diagram: `+-------------------------------------------------------------+
-|              NEUTRALISATION SUR PARTITION UNIQUE             |
-+-------------------------------------------------------------+
- Carte SD / Disque (1 Seule Partition Continue) :
- [Bloc Sain 1]  [Zone HS Neutralisée (0xFFFFFFF7)]  [Bloc Sain 2]
-                          ▲
-       La caméra ou l'OS saute la zone morte sans bloquer.
-  Votre support reste intact en 1 seul volume compatible !`,
-      benefits: [
-        "Conserve 1 SEULE partition continue : compatible 100% avec les caméras, enregistreurs et ordinateurs.",
-        "Évite de jeter un support qui ne présente que quelques secteurs défaillants isolés.",
-        "Détecte la saturation de réserve pour vous avertir avant la perte irrémédiable de données.",
-      ],
-    },
-  },
-
-  tool9: {
-    id: "tool9",
-    number: "Outil 9",
-    title: "Régénération de Surface (Charge Refresh Flash & Remagnétisation HDD)",
-    badge: "Zéro Risque Matériel • Zéro Perte de Données",
-    accentColor: "text-[#FBBF24]",
-    bgLightColor: "bg-[#F59E0B]/15 text-[#FBBF24] border-[#F59E0B]/30",
-    simpleExplanation:
-      "La mémoire flash stocke les données sous forme de charges électriques qui faiblissent avec le temps et la chaleur. Les disques durs HDD stockent les bits sous forme d'orientation magnétique qui s'atténue avec l'usure. Cet outil applique un protocole non destructif adapté : rafraîchissement des niveaux de tension électrique pour les cartes SD/SSD, ou remagnétisation dynamique des pistes LBA pour les HDD. Votre support retrouve sa vitesse d'origine sous 1 ms, sans aucun risque pour vos fichiers.",
-    technicalDetails: {
-      overview:
-        "Protocole d'étalonnage physique non destructif ('Read-Verify-Refresh') restaurant la tension des grilles flash ou la rémanence magnétique des pistes HDD.",
-      keyMechanisms: [
-        {
-          title: "Cycle Atomique 'Read-Verify-Refresh'",
-          desc: "1. Lecture atomique du secteur fatigué dans la mémoire vive tampon (RAM).\n2. Vérification rigoureuse de l'intégrité via checksum CRC32.\n3. Réécriture immédiate avec forçage de synchronisation matérielle (`F_FULLFSYNC` / `fsync`).\n4. Sur Flash : le contrôleur réinjecte des électrons à tension nominale. Sur HDD : la tête d'écriture remagnétise les domaines magnétiques affaiblis avec purge du cache.",
-        },
-        {
-          title: "Restauration Immédiate de la Latence (< 1 ms)",
-          desc: "Les secteurs fatigués qui mettaient entre 5 et 50 ms à répondre retombent instantanément sous la barre des 1000 µs (Vert), éliminant les réessais intempestifs.",
-        },
-        {
-          title: "Zéro Risque Matériel & Zéro Perte",
-          desc: "L'opération s'effectue bloc par bloc en mémoire tampon. Même en cas de coupure de courant accidentelle, aucune donnée n'est perdue.",
-        },
-      ],
-      diagram: `+-------------------------------------------------------------+
-|        CYCLE DE RÉGÉNÉRATION CELLULAIRE (CHARGE REFRESH)    |
-+-------------------------------------------------------------+
-  État Fatigué (Jaune 5-50 ms) :
-  Grille Flottante Flash : [Charge Déchargée / Fuite Électrique]
-             │
-             ├──> 1. Lecture atomique en mémoire tampon RAM
-             ├──> 2. Contrôle de cohérence CRC32
-             └──> 3. Réécriture forcée à tension nominale maximale
-             │
-  État Régénéré (Vert < 1 ms) :
-  Grille Flottante Flash : [Électrons Frais à Pleine Tension] ===> Latence < 1 ms`,
-      benefits: [
-        "Ressuscite les cellules lentes avant qu'elles ne deviennent des secteurs morts.",
-        "Supprime les saccades et baisses de débit en enregistrement vidéo 4K/8K.",
-        "Restaure les performances d'origine sans devoir formater la carte.",
+        "100% sûr : aucune écriture sur la carte ou le disque analysé.",
+        "Met en évidence les ralentissements de lecture réels avant sauvegarde.",
       ],
     },
   },
 };
-
